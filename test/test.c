@@ -461,6 +461,7 @@ int main (int argc, char **argv) {
   SCHEDULE (usage);
   SCHEDULE (main);
   SCHEDULE (collect);
+  SCHEDULE (evo);
   SCHEDULE (kitten);
   SCHEDULE (solve);
   SCHEDULE (coverage);

@@ -108,6 +108,8 @@ struct Result {
   Genome genome;
   double fitness = 0.0;
   int status = 0;
+  double elapsed = 0.0;
+  bool improved = false;
 };
 
 struct TerminationState {
@@ -578,6 +580,7 @@ static Result evaluate_genome (const Genome &g, const Formula &formula,
   const double start = kissat_wall_clock_time ();
   const int status = kissat_solve (solver);
   const double end = kissat_wall_clock_time ();
+  res.elapsed = end - start;
 
   res.status = status;
   res.fitness = 0.0;
@@ -593,6 +596,7 @@ static Result evaluate_genome (const Genome &g, const Formula &formula,
     std::lock_guard<std::mutex> lock (best_mutex);
     if (res.fitness > best_fitness) {
       best_fitness = res.fitness;
+      res.improved = true;
       export_it = true;
     } else if (best_fitness > 0 &&
                res.fitness >= best_fitness * 0.95) {
@@ -696,8 +700,10 @@ int main (int argc, char **argv) {
   int solution_status = 0;
 
   unsigned evaluations = 0;
+  unsigned generation = 0;
 
   while (!stop.load () && evaluations < opts.max_evals) {
+    const double gen_start = kissat_wall_clock_time ();
     std::vector<Result> results (population.size ());
     std::atomic<size_t> next (0);
     std::vector<std::thread> threads;
@@ -728,6 +734,51 @@ int main (int argc, char **argv) {
       th.join ();
 
     evaluations += population.size ();
+    generation++;
+
+    if (!opts.quiet) {
+      unsigned sat = 0, unsat = 0, unknown = 0, improved = 0;
+      double sum_fitness = 0.0;
+      double best_f = 0.0;
+      double min_elapsed = 0.0, max_elapsed = 0.0, sum_elapsed = 0.0;
+      for (size_t i = 0; i < results.size (); i++) {
+        const Result &r = results[i];
+        if (r.status == 10)
+          sat++;
+        else if (r.status == 20)
+          unsat++;
+        else
+          unknown++;
+        if (r.fitness > best_f)
+          best_f = r.fitness;
+        sum_fitness += r.fitness;
+        if (!i || r.elapsed < min_elapsed)
+          min_elapsed = r.elapsed;
+        if (!i || r.elapsed > max_elapsed)
+          max_elapsed = r.elapsed;
+        sum_elapsed += r.elapsed;
+        if (r.improved)
+          improved++;
+      }
+      const double avg_fitness =
+          results.empty () ? 0.0 : sum_fitness / results.size ();
+      const double avg_elapsed =
+          results.empty () ? 0.0 : sum_elapsed / results.size ();
+      size_t pool_size = 0;
+      {
+        std::lock_guard<std::mutex> lock (pool.mutex);
+        pool_size = pool.clauses.size ();
+      }
+      const double gen_end = kissat_wall_clock_time ();
+      printf ("c gen %u evals %u best %.6g avg %.6g "
+              "sat %u unsat %u unk %u pool %zu "
+              "eval_time min %.3f avg %.3f max %.3f "
+              "gen_time %.3f improved %u\n",
+              generation, evaluations, best_f, avg_fitness, sat, unsat,
+              unknown, pool_size, min_elapsed, avg_elapsed, max_elapsed,
+              gen_end - gen_start, improved);
+      fflush (stdout);
+    }
 
     if (stop.load ())
       break;
