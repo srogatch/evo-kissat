@@ -132,7 +132,7 @@ struct EvoOptions {
   unsigned threads = 0;
   unsigned population = 0;
   unsigned max_evals = 0;
-  unsigned share_in = 200;
+  unsigned share_in = 0;
   unsigned share_out = 200;
   unsigned share_pool = 50000000;
   unsigned share_max_size = 12;
@@ -216,7 +216,7 @@ static void print_usage (const char *name) {
   printf ("  --evo-pop=<n>              population size\n");
   printf ("  --evo-evals=<n>            max evaluations (0 = unlimited)\n");
   printf ("  --evo-conflicts=<n>        alias for --conflicts\n");
-  printf ("  --evo-share=<n>            large clauses imported per evaluation\n");
+  printf ("  --evo-share=<n>            max large clauses imported per evaluation (0=auto)\n");
   printf ("  --evo-share-out=<n>        large clauses exported per evaluation\n");
   printf ("  --evo-share-pool=<n>       shared pool size\n");
   printf ("  --evo-share-size=<n>       max shared clause size\n");
@@ -615,8 +615,11 @@ static void import_shared (kissat *solver, const Formula &formula,
     binaries.reserve (pool.binaries.size ());
     for (uint64_t key : pool.binaries)
       binaries.push_back (decode_binary_key (key));
-    if (limit && !pool.clauses.empty ()) {
-      const size_t n = std::min<size_t> (limit, pool.clauses.size ());
+    size_t large_limit = (size_t) kissat_get_solver_irredundant_clauses (solver);
+    if (limit && large_limit > limit)
+      large_limit = limit;
+    if (large_limit && !pool.clauses.empty ()) {
+      const size_t n = std::min<size_t> (large_limit, pool.clauses.size ());
       subset.reserve (n);
       std::uniform_int_distribution<size_t> dist (0,
                                                   pool.clauses.size () - 1);
