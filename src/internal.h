@@ -107,6 +107,7 @@ struct kissat {
 
   ints export;
   ints units;
+  ints shared_binaries;
   imports import;
   extensions extend;
   unsigneds witness;

@@ -111,6 +111,7 @@ void kissat_release (kissat *solver) {
   RELEASE_STACK (solver->arena);
 
   RELEASE_STACK (solver->units);
+  RELEASE_STACK (solver->shared_binaries);
   RELEASE_STACK (solver->frames);
   RELEASE_STACK (solver->sorter);
 
@@ -470,6 +471,171 @@ void kissat_add (kissat *solver, int elit) {
     solver->clause_trivial = false;
     solver->clause_shrink = false;
   }
+}
+
+void kissat_export_shared_clauses (kissat *solver, unsigned max_size,
+                                   unsigned max_glue, unsigned max_clauses,
+                                   void *state,
+                                   kissat_shared_clause_consumer consumer) {
+  kissat_require_initialized (solver);
+  kissat_require (consumer, "consumer zero pointer");
+
+  size_t exported = 0;
+  int *buffer = 0;
+  size_t capacity = 0;
+
+  if (!max_size || max_size >= 2) {
+    const int *p = BEGIN_STACK (solver->shared_binaries);
+    const int *const end = END_STACK (solver->shared_binaries);
+    for (; p + 1 < end; p += 2) {
+      if (max_clauses && exported >= max_clauses)
+        goto DONE;
+      const int pair[2] = {p[0], p[1]};
+      if (consumer (state, 2, 1, pair))
+        goto DONE;
+      exported++;
+    }
+  }
+
+  for (all_clauses (c)) {
+    if (max_clauses && exported >= max_clauses)
+      break;
+    if (c->garbage || !c->redundant)
+      continue;
+    if (max_size && c->size > max_size)
+      continue;
+    if (max_glue && c->glue > max_glue)
+      continue;
+
+    if (c->size > capacity) {
+      const size_t old_bytes = capacity * sizeof *buffer;
+      capacity = c->size;
+      const size_t new_bytes = capacity * sizeof *buffer;
+      buffer = kissat_realloc (solver, buffer, old_bytes, new_bytes);
+    }
+
+    bool ok = true;
+    unsigned i = 0;
+    for (all_literals_in_clause (lit, c)) {
+      int elit = kissat_export_literal (solver, lit);
+      if (!elit) {
+        ok = false;
+        break;
+      }
+      const unsigned eidx = ABS (elit);
+      if (eidx >= SIZE_STACK (solver->import)) {
+        ok = false;
+        break;
+      }
+      const import *const import = &PEEK_STACK (solver->import, eidx);
+      if (import->eliminated) {
+        ok = false;
+        break;
+      }
+      buffer[i++] = elit;
+    }
+    if (!ok)
+      continue;
+    if (consumer (state, c->size, c->glue, buffer))
+      break;
+    exported++;
+  }
+
+DONE:
+  if (buffer)
+    kissat_free (solver, buffer, capacity * sizeof *buffer);
+}
+
+int kissat_import_shared_clause (kissat *solver, unsigned size,
+                                 const int *lits, unsigned glue) {
+  kissat_require_initialized (solver);
+  kissat_require (!GET (searches), "incremental solving not supported");
+#ifndef NPROOFS
+  kissat_require (!kissat_proving (solver),
+                  "can not import shared clauses while proving");
+#endif
+  kissat_require (EMPTY_STACK (solver->clause),
+                  "incomplete clause (terminating zero not added)");
+  kissat_require (lits || !size, "literal array zero pointer");
+
+  if (!size) {
+    if (!solver->inconsistent) {
+      solver->inconsistent = true;
+      CHECK_AND_ADD_EMPTY ();
+      ADD_EMPTY_TO_PROOF ();
+    }
+    return 2;
+  }
+
+  solver->clause_satisfied = false;
+  solver->clause_trivial = false;
+  solver->clause_shrink = false;
+
+  for (unsigned i = 0; i < size; i++) {
+    const int elit = lits[i];
+    kissat_require (elit, "zero literal in shared clause");
+    kissat_require_valid_external_internal (elit);
+    unsigned ilit = kissat_import_literal (solver, elit);
+
+    const mark mark = MARK (ilit);
+    if (!mark) {
+      const value value = kissat_fixed (solver, ilit);
+      if (value > 0) {
+        solver->clause_satisfied = true;
+      } else if (value < 0) {
+        solver->clause_shrink = true;
+      } else {
+        MARK (ilit) = 1;
+        MARK (NOT (ilit)) = -1;
+        assert (SIZE_STACK (solver->clause) < UINT_MAX);
+        PUSH_STACK (solver->clause, ilit);
+      }
+    } else if (mark < 0) {
+      solver->clause_trivial = true;
+    } else {
+      solver->clause_shrink = true;
+    }
+  }
+
+  const size_t isize = SIZE_STACK (solver->clause);
+  unsigned *ilits = BEGIN_STACK (solver->clause);
+  int res = 0;
+
+  if (solver->inconsistent) {
+    res = 2;
+  } else if (solver->clause_satisfied || solver->clause_trivial) {
+    res = 0;
+  } else {
+    kissat_activate_literals (solver, isize, ilits);
+    if (!isize) {
+      if (!solver->inconsistent) {
+        solver->inconsistent = true;
+        CHECK_AND_ADD_EMPTY ();
+        ADD_EMPTY_TO_PROOF ();
+      }
+      res = 2;
+    } else if (isize == 1) {
+      const unsigned unit = TOP_STACK (solver->clause);
+      kissat_learned_unit (solver, unit);
+      if (!solver->level)
+        (void) kissat_search_propagate (solver);
+      res = 1;
+    } else {
+      (void) kissat_new_redundant_clause (solver, glue);
+      res = 1;
+    }
+  }
+
+  for (all_stack (unsigned, lit, solver->clause))
+    MARK (lit) = MARK (NOT (lit)) = 0;
+
+  CLEAR_STACK (solver->clause);
+
+  solver->clause_satisfied = false;
+  solver->clause_trivial = false;
+  solver->clause_shrink = false;
+
+  return res;
 }
 
 int kissat_solve (kissat *solver) {

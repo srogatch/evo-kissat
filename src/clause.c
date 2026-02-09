@@ -72,6 +72,19 @@ static reference new_binary_clause (kissat *solver, bool original,
   kissat_mark_added_literal (solver, second);
   inc_clause (solver, original, false, true);
   if (!original) {
+    int elit = kissat_export_literal (solver, first);
+    int eother = kissat_export_literal (solver, second);
+    if (elit && eother) {
+      if (elit > eother) {
+        const int tmp = elit;
+        elit = eother;
+        eother = tmp;
+      }
+      PUSH_STACK (solver->shared_binaries, elit);
+      PUSH_STACK (solver->shared_binaries, eother);
+    }
+  }
+  if (!original) {
     CHECK_AND_ADD_BINARY (first, second);
     ADD_BINARY_TO_PROOF (first, second);
   }

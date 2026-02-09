@@ -455,6 +455,7 @@ int main (int argc, char **argv) {
   SCHEDULE (config);
   SCHEDULE (init);
   SCHEDULE (add);
+  SCHEDULE (share);
   SCHEDULE (file);
   SCHEDULE (parse);
   SCHEDULE (usage);
