@@ -312,6 +312,8 @@ double kissat_get_remaining_clause_score (kissat *solver) {
     bool satisfied = false;
     unsigned remaining = 0;
     for (all_literals_in_clause (lit, c)) {
+      if (lit == INVALID_LIT || lit >= LITS)
+        continue;
       value v = values[lit];
       if (v > 0) {
         satisfied = true;
@@ -338,6 +340,8 @@ double kissat_get_remaining_clause_score (kissat *solver) {
         if (!watch.type.binary)
           continue;
         const unsigned other = watch.binary.lit;
+        if (other == INVALID_LIT || other >= LITS)
+          continue;
         const value v1 = values[lit];
         const value v2 = values[other];
         if (v1 > 0 || v2 > 0)
@@ -358,6 +362,8 @@ double kissat_get_remaining_clause_score (kissat *solver) {
         if (!watch.type.binary)
           continue;
         const unsigned other = watch.binary.lit;
+        if (other == INVALID_LIT || other >= LITS)
+          continue;
         const value v1 = values[lit];
         const value v2 = values[other];
         if (v1 > 0 || v2 > 0)

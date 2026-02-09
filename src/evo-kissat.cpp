@@ -740,8 +740,10 @@ static Result evaluate_genome (const Genome &g, const Formula &formula,
   if (status == 10 || status == 20)
     res.fitness = 1e30;
   else {
-    const double clause_score = kissat_get_remaining_clause_score (solver);
-    res.fitness = std::sqrt(clause_score)
+    double clause_score = kissat_get_remaining_clause_score (solver);
+    if (clause_score < 0.0)
+      clause_score = 0.0;
+    res.fitness = std::sqrt (clause_score)
       - (double) res.remaining_vars + (double) formula.max_var;
   }
 
