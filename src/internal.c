@@ -626,16 +626,19 @@ void kissat_export_shared_clauses (kissat *solver, unsigned max_size,
   int *buffer = 0;
   size_t capacity = 0;
 
-  if (!max_size || max_size >= 2) {
+  for (all_stack (int, unit, solver->units)) {
+    const int lit = unit;
+    if (consumer (state, 1, 1, &lit))
+      goto DONE;
+  }
+
+  {
     const int *p = BEGIN_STACK (solver->shared_binaries);
     const int *const end = END_STACK (solver->shared_binaries);
     for (; p + 1 < end; p += 2) {
-      if (max_clauses && exported >= max_clauses)
-        goto DONE;
       const int pair[2] = {p[0], p[1]};
       if (consumer (state, 2, 1, pair))
         goto DONE;
-      exported++;
     }
   }
 
