@@ -552,6 +552,7 @@ static Result evaluate_genome (const Genome &g, const Formula &formula,
                                std::atomic<bool> &stop,
                                double deadline, std::mutex &best_mutex,
                                double &best_fitness,
+                               std::atomic<double> &best_so_far,
                                std::mutex &solution_mutex,
                                kissat *&solution_solver,
                                int &solution_status) {
@@ -596,6 +597,7 @@ static Result evaluate_genome (const Genome &g, const Formula &formula,
     std::lock_guard<std::mutex> lock (best_mutex);
     if (res.fitness > best_fitness) {
       best_fitness = res.fitness;
+      best_so_far.store (best_fitness, std::memory_order_relaxed);
       res.improved = true;
       export_it = true;
     } else if (best_fitness > 0 &&
@@ -694,6 +696,7 @@ int main (int argc, char **argv) {
 
   std::mutex best_mutex;
   double best_fitness = 0.0;
+  std::atomic<double> best_so_far (0.0);
 
   std::mutex solution_mutex;
   kissat *solution_solver = nullptr;
@@ -706,8 +709,43 @@ int main (int argc, char **argv) {
     const double gen_start = kissat_wall_clock_time ();
     std::vector<Result> results (population.size ());
     std::atomic<size_t> next (0);
+    std::atomic<size_t> completed (0);
+    std::atomic<bool> gen_done (false);
     std::vector<std::thread> threads;
     threads.reserve (opts.threads);
+
+    if (!opts.quiet) {
+      printf ("c gen %u start pop %zu evals %u\n", generation + 1,
+              population.size (), evaluations);
+      fflush (stdout);
+    }
+
+    std::thread monitor;
+    if (!opts.quiet) {
+      monitor = std::thread ([&] () {
+        double last = kissat_wall_clock_time ();
+        while (!gen_done.load ()) {
+          std::this_thread::sleep_for (std::chrono::milliseconds (200));
+          const double now = kissat_wall_clock_time ();
+          if (now - last < 10.0)
+            continue;
+          last = now;
+          const size_t done = completed.load ();
+          size_t pool_size = 0;
+          {
+            std::lock_guard<std::mutex> lock (pool.mutex);
+            pool_size = pool.clauses.size ();
+          }
+          const double best = best_so_far.load (std::memory_order_relaxed);
+          printf ("c gen %u progress %zu/%zu best %.6g pool %zu elapsed %.1f\n",
+                  generation + 1, done, population.size (), best, pool_size,
+                  now - gen_start);
+          fflush (stdout);
+          if (done >= population.size ())
+            break;
+        }
+      });
+    }
 
     for (unsigned t = 0; t < opts.threads; t++) {
       threads.emplace_back ([&] () {
@@ -723,15 +761,20 @@ int main (int argc, char **argv) {
             return;
           Result r = evaluate_genome (population[idx], formula, opts,
                                       specs, pool, stop, deadline, best_mutex,
-                                      best_fitness, solution_mutex,
+                                      best_fitness, best_so_far,
+                                      solution_mutex,
                                       solution_solver, solution_status);
           results[idx] = std::move (r);
+          completed.fetch_add (1);
         }
       });
     }
 
     for (auto &th : threads)
       th.join ();
+    gen_done.store (true);
+    if (monitor.joinable ())
+      monitor.join ();
 
     evaluations += population.size ();
     generation++;
