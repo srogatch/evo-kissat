@@ -6,6 +6,8 @@ VPATH=../src:../test
 
 %.o: %.c ../[st]*/*.h makefile
 	$(CC) -c $<
+%.o: %.cpp ../[st]*/*.h makefile
+	$(CC) -c $<
 
 APPSRC=application.c handle.c parse.c witness.c
 
@@ -25,7 +27,7 @@ INCLUDES=-I../$(shell pwd|sed -e 's,.*/,,')
 
 LIBS=libkissat.a
 
-all: @GOALS@
+all: @GOALS@ evo-kissat
 
 test: all tissat
 	./tissat
@@ -33,7 +35,7 @@ test: all tissat
 REMOVE=*.gcda *.gcno *.gcov gmon.out *~ *.proof
 
 clean:
-	rm -f kissat tissat kitten
+	rm -f kissat tissat kitten evo-kissat
 	rm -f makefile build.h *.o *.a *.so
 	rm -f $(REMOVE)
 	cd ../src; rm -f $(REMOVE)
@@ -47,6 +49,9 @@ format:
 
 kissat: main.o $(APPOBJ) libkissat.a makefile
 	$(LD) -o $@ main.o $(APPOBJ) $(LIBS) -lm
+
+evo-kissat: evo-kissat.o libkissat.a makefile
+	$(LD) -o $@ evo-kissat.o $(LIBS) -lm -lstdc++
 
 tissat: test.o $(TSTOBJ) libkissat.a makefile
 	$(LD) -o $@ test.o $(TSTOBJ) $(LIBS) -lm
