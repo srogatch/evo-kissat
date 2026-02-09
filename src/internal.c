@@ -14,6 +14,7 @@
 #include <assert.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -385,78 +386,22 @@ double kissat_get_remaining_clause_score (kissat *solver) {
 
 double kissat_get_remaining_unfitness (kissat *solver) {
   kissat_require_initialized (solver);
-  value *values = solver->values;
-  double clause_penalty = 0.0;
   const double n_rem_vars = (double) solver->active;
-
-  for (all_clauses (c)) {
-    if (c->garbage)
-      continue;
-    bool satisfied = false;
-    unsigned remaining = 0;
-    for (all_literals_in_clause (lit, c)) {
-      if (lit == INVALID_LIT || lit >= LITS)
-        continue;
-      const value v = values[lit];
-      if (v > 0) {
-        satisfied = true;
-        break;
-      }
-      if (!v)
-        remaining++;
-    }
-    if (satisfied)
-      continue;
-    const int delta = (int) remaining - 1;
-    clause_penalty += (double) delta * (double) delta;
-  }
-
-  // Binary clauses are represented in both watch lists, so each surviving
-  // binary is seen twice while traversing all literals.
-  double binary_penalty = 0.0;
-  if (solver->watching) {
-    for (all_literals (lit)) {
-      watches *watches = &WATCHES (lit);
-      for (all_binary_blocking_watches (watch, *watches)) {
-        if (!watch.type.binary)
-          continue;
-        const unsigned other = watch.binary.lit;
-        if (other == INVALID_LIT || other >= LITS)
-          continue;
-        const value v1 = values[lit];
-        const value v2 = values[other];
-        if (v1 > 0 || v2 > 0)
-          continue;
-        const unsigned remaining = (!v1) + (!v2);
-        const int delta = (int) remaining - 1;
-        binary_penalty += (double) delta * (double) delta;
-      }
-    }
-  } else {
-    for (all_literals (lit)) {
-      watches *watches = &WATCHES (lit);
-      for (all_binary_large_watches (watch, *watches)) {
-        if (!watch.type.binary)
-          continue;
-        const unsigned other = watch.binary.lit;
-        if (other == INVALID_LIT || other >= LITS)
-          continue;
-        const value v1 = values[lit];
-        const value v2 = values[other];
-        if (v1 > 0 || v2 > 0)
-          continue;
-        const unsigned remaining = (!v1) + (!v2);
-        const int delta = (int) remaining - 1;
-        binary_penalty += (double) delta * (double) delta;
-      }
-    }
-  }
-
-  clause_penalty += 0.5 * binary_penalty;
+  const double n_binary_clauses = (double) solver->statistics.clauses_binary;
 
   // Unfitness formula:
-  // nRemVars^2 + sum((clauseSize_i - 1)^2)
-  return n_rem_vars * n_rem_vars + clause_penalty;
+  // nRemVars - (1 + sqrt(8*nBinaryClauses))/2
+  return n_rem_vars - (1.0 + sqrt (8.0 * n_binary_clauses)) / 2.0;
+}
+
+static bool shareable_external_literal (kissat *solver, int elit) {
+  if (!elit)
+    return false;
+  const unsigned eidx = ABS (elit);
+  if (eidx >= SIZE_STACK (solver->import))
+    return false;
+  const import *const imported = &PEEK_STACK (solver->import, eidx);
+  return imported->imported && !imported->eliminated;
 }
 
 void kissat_set_initial_phases (kissat *solver, const int8_t *phases,
@@ -710,6 +655,8 @@ void kissat_export_shared_clauses (kissat *solver, unsigned max_size,
 
   for (all_stack (int, unit, solver->units)) {
     const int lit = unit;
+    if (!shareable_external_literal (solver, lit))
+      continue;
     if (consumer (state, 1, 1, &lit))
       goto DONE;
   }
@@ -718,6 +665,9 @@ void kissat_export_shared_clauses (kissat *solver, unsigned max_size,
     const int *p = BEGIN_STACK (solver->shared_binaries);
     const int *const end = END_STACK (solver->shared_binaries);
     for (; p + 1 < end; p += 2) {
+      if (!shareable_external_literal (solver, p[0]) ||
+          !shareable_external_literal (solver, p[1]))
+        continue;
       const int pair[2] = {p[0], p[1]};
       if (consumer (state, 2, 1, pair))
         goto DONE;

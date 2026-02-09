@@ -69,10 +69,6 @@ static void print_witness (kissat *solver, int max_var, bool partial) {
 struct SharedPool {
   std::mutex mutex;
   std::vector<SharedClause> clauses;
-  std::vector<int> units;
-  std::vector<std::array<int, 2>> binaries;
-  std::unordered_set<int> unit_set;
-  std::unordered_set<uint64_t> binary_set;
   size_t max_clauses = 0;
 };
 
@@ -591,13 +587,9 @@ static void apply_options (kissat *solver, const EvoOptions &opts,
 
 static void import_shared (kissat *solver, SharedPool &pool,
                            unsigned limit, std::mt19937 &rng) {
-  std::vector<int> units;
-  std::vector<std::array<int, 2>> binaries;
   std::vector<SharedClause> subset;
   {
     std::lock_guard<std::mutex> lock (pool.mutex);
-    units = pool.units;
-    binaries = pool.binaries;
     if (limit && !pool.clauses.empty ()) {
       const size_t n = std::min<size_t> (limit, pool.clauses.size ());
       subset.reserve (n);
@@ -608,16 +600,6 @@ static void import_shared (kissat *solver, SharedPool &pool,
         subset.push_back (pool.clauses[idx]);
       }
     }
-  }
-  for (int lit : units) {
-    int tmp = lit;
-    if (kissat_import_shared_clause (solver, 1, &tmp, 1) == 2)
-      return;
-  }
-  for (const auto &bin : binaries) {
-    const int pair[2] = {bin[0], bin[1]};
-    if (kissat_import_shared_clause (solver, 2, pair, 1) == 2)
-      return;
   }
   for (const auto &cl : subset)
     if (kissat_import_shared_clause (solver, (unsigned) cl.lits.size (),
@@ -634,22 +616,9 @@ struct ExportContext {
 static int export_shared_clause (void *state, unsigned size, unsigned glue,
                                  const int *lits) {
   ExportContext *ctx = static_cast<ExportContext *> (state);
-  if (size == 1) {
-    const int lit = lits[0];
-    std::lock_guard<std::mutex> lock (ctx->pool->mutex);
-    if (ctx->pool->unit_set.insert (lit).second)
-      ctx->pool->units.push_back (lit);
-    return 0;
-  }
-  if (size == 2) {
-    int a = lits[0], b = lits[1];
-    if (a > b)
-      std::swap (a, b);
-    const uint64_t key =
-        ((uint64_t) (uint32_t) a << 32) | (uint32_t) b;
-    std::lock_guard<std::mutex> lock (ctx->pool->mutex);
-    if (ctx->pool->binary_set.insert (key).second)
-      ctx->pool->binaries.push_back ({a, b});
+  if (size <= 2) {
+    // Unit/binary sharing can become stale under aggressive inprocessing.
+    // Only keep larger learned clauses in the cross-solver pool.
     return 0;
   }
   SharedClause cl;
@@ -766,9 +735,10 @@ static Result evaluate_genome (const Genome &g, const Formula &formula,
       best_so_far.store (best_unfitness, std::memory_order_relaxed);
       res.improved = true;
       export_it = true;
-    } else if (best_unfitness > 0 &&
-               res.unfitness <= best_unfitness * 1.05) {
-      export_it = true;
+    } else {
+      const double tolerance = std::max (1e-9, std::fabs (best_unfitness) * 0.05);
+      if (res.unfitness <= best_unfitness + tolerance)
+        export_it = true;
     }
   }
 

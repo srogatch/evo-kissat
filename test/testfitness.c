@@ -45,7 +45,7 @@ static void test_remaining_unfitness_formula (void) {
   kissat_add (solver, 2);
   kissat_add (solver, 0);
 
-  const double expected = 30.0;
+  const double expected = 2.0857864376269049;
   const double got = kissat_get_remaining_unfitness (solver);
   if (fabs (got - expected) > 1e-9)
     FATAL ("expected unfitness %.17g, got %.17g", expected, got);
