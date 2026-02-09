@@ -120,7 +120,7 @@ struct EvoOptions {
   unsigned max_evals = 0;
   unsigned share_in = 200;
   unsigned share_out = 200;
-  unsigned share_pool = 5000;
+  unsigned share_pool = 50000000;
   unsigned share_max_size = 12;
   unsigned share_max_glue = 4;
   unsigned evo_seed = 0;
