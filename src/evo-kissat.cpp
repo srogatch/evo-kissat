@@ -104,6 +104,7 @@ struct EvoOptions {
   int conflicts_limit = 10000;
   int decisions_limit = -1;
   int time_limit = 0;
+  int eval_time_limit = 10;
   std::string input_path;
   std::string config;
   std::vector<std::pair<std::string, int>> overrides;
@@ -196,6 +197,7 @@ static void print_usage (const char *name) {
   printf ("  --evo-share-pool=<n>       shared pool size\n");
   printf ("  --evo-share-size=<n>       max shared clause size\n");
   printf ("  --evo-share-glue=<n>       max shared clause glue\n");
+  printf ("  --evo-eval-time=<n>        per-evaluation time budget (seconds, 0 = no limit)\n");
   printf ("  --evo-threads=<n>          worker threads\n");
   printf ("  --evo-seed=<n>             RNG seed\n");
 }
@@ -262,6 +264,8 @@ static bool parse_args (int argc, char **argv, EvoOptions &opts) {
         ;
       else if (parse_uint_option (arg, "evo-share-glue", opts.share_max_glue))
         ;
+      else if (parse_int_option (arg, "evo-eval-time", opts.eval_time_limit))
+        ;
       else if (parse_uint_option (arg, "evo-threads", opts.threads))
         ;
       else if (parse_uint_option (arg, "evo-seed", opts.evo_seed))
@@ -296,6 +300,10 @@ static bool parse_args (int argc, char **argv, EvoOptions &opts) {
       }
     }
     continue;
+  }
+  if (opts.eval_time_limit < 0) {
+    fprintf (stderr, "invalid --evo-eval-time=%d\n", opts.eval_time_limit);
+    return false;
   }
   return true;
 }
@@ -616,8 +624,39 @@ static Result evaluate_genome (const Genome &g, const Formula &formula,
     kissat_set_decision_limit (solver, (unsigned) opts.decisions_limit);
 
   const double start = kissat_wall_clock_time ();
+  std::atomic<bool> eval_done (false);
+  std::thread eval_timer;
+  if (opts.eval_time_limit > 0 || deadline > 0) {
+    double until = 0.0;
+    if (opts.eval_time_limit > 0)
+      until = start + opts.eval_time_limit;
+    if (deadline > 0 && (until == 0.0 || deadline < until))
+      until = deadline;
+    eval_timer = std::thread ([&] () {
+      for (;;) {
+        if (eval_done.load ())
+          return;
+        const double now = kissat_wall_clock_time ();
+        if (now >= until) {
+          kissat_terminate (solver);
+          return;
+        }
+        const double remaining = until - now;
+        int sleep_ms = (int) (remaining * 1000.0);
+        if (sleep_ms > 25)
+          sleep_ms = 25;
+        if (sleep_ms < 1)
+          sleep_ms = 1;
+        std::this_thread::sleep_for (
+            std::chrono::milliseconds (sleep_ms));
+      }
+    });
+  }
   const int status = kissat_solve (solver);
   const double end = kissat_wall_clock_time ();
+  eval_done.store (true);
+  if (eval_timer.joinable ())
+    eval_timer.join ();
   res.elapsed = end - start;
 
   res.status = status;
@@ -626,7 +665,11 @@ static Result evaluate_genome (const Genome &g, const Formula &formula,
     res.fitness = 1e30;
   else {
     const double elapsed = end - start;
-    res.fitness = 1.0 / (1.0 + elapsed);
+    const double denom = elapsed > 0 ? elapsed : 1e-9;
+    const uint64_t conflicts = kissat_get_solver_conflicts (solver);
+    const uint64_t learned = kissat_get_solver_learned (solver);
+    const double progress = (double) conflicts + (double) learned;
+    res.fitness = progress / denom;
   }
   res.evaluated = true;
   res.aborted = gen_abort.load () && status == 0;
@@ -759,7 +802,8 @@ int main (int argc, char **argv) {
     std::atomic<bool> gen_done (false);
     std::atomic<bool> gen_abort (false);
     const unsigned half_cores = std::max (1u, logical_cores / 2);
-    const bool allow_cutoff = population.size () >= half_cores;
+    const bool allow_cutoff =
+        (opts.eval_time_limit == 0) && population.size () >= half_cores;
     std::vector<std::thread> threads;
     threads.reserve (opts.threads);
 
@@ -803,6 +847,7 @@ int main (int argc, char **argv) {
             return;
           if (deadline > 0 && kissat_wall_clock_time () >= deadline) {
             stop.store (true);
+            terminate_active (active);
             return;
           }
           size_t idx = next.fetch_add (1);

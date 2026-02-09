@@ -1,6 +1,8 @@
 #ifndef _kissat_h_INCLUDED
 #define _kissat_h_INCLUDED
 
+#include <stdint.h>
+
 typedef struct kissat kissat;
 
 // Default (partial) IPASIR interface.
@@ -40,6 +42,8 @@ void kissat_set_conflict_limit (kissat *solver, unsigned);
 void kissat_set_decision_limit (kissat *solver, unsigned);
 
 void kissat_print_statistics (kissat *solver);
+uint64_t kissat_get_solver_conflicts (kissat *solver);
+uint64_t kissat_get_solver_learned (kissat *solver);
 
 // Clause sharing between solver instances (portfolio / EA).
 //

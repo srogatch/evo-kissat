@@ -264,6 +264,16 @@ void kissat_print_statistics (kissat *solver) {
   (void) solver;
 }
 
+uint64_t kissat_get_solver_conflicts (kissat *solver) {
+  kissat_require_initialized (solver);
+  return solver->statistics.conflicts;
+}
+
+uint64_t kissat_get_solver_learned (kissat *solver) {
+  kissat_require_initialized (solver);
+  return solver->statistics.clauses_learned;
+}
+
 void kissat_add (kissat *solver, int elit) {
   kissat_require_initialized (solver);
   kissat_require (!GET (searches), "incremental solving not supported");
