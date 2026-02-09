@@ -18,6 +18,7 @@ extern "C" {
 #include "config.h"
 #include "file.h"
 #include "kissat.h"
+#include "literal.h"
 #include "options.h"
 #include "resources.h"
 // local witness printing (avoid linking application objects)
@@ -400,14 +401,27 @@ static bool parse_dimacs (const char *path, Formula &formula) {
       kissat_close_file (&file);
       return false;
     }
-    int val = 0;
-    while (std::isdigit ((unsigned char) ch)) {
-      val = val * 10 + (ch - '0');
-      ch = scanner.get ();
+    int idx = ch - '0';
+    while (std::isdigit ((unsigned char) (ch = scanner.get ()))) {
+      // Keep parsing bounded to the same external literal range that
+      // `kissat_add` accepts, instead of letting malformed numbers reach it.
+      if (EXTERNAL_MAX_VAR / 10 < idx) {
+        fprintf (stderr, "parse error at line %" PRIu64 "\n", scanner.line);
+        kissat_close_file (&file);
+        return false;
+      }
+      idx *= 10;
+      const int digit = ch - '0';
+      if (EXTERNAL_MAX_VAR - digit < idx) {
+        fprintf (stderr, "parse error at line %" PRIu64 "\n", scanner.line);
+        kissat_close_file (&file);
+        return false;
+      }
+      idx += digit;
     }
     if (ch != EOF)
       scanner.putback (ch);
-    val *= sign;
+    const int val = sign * idx;
 
     if (!val) {
       formula.clauses++;
@@ -418,9 +432,8 @@ static bool parse_dimacs (const char *path, Formula &formula) {
       continue;
     }
 
-    const int abs_val = val < 0 ? -val : val;
-    if (abs_val > formula.max_var)
-      formula.max_var = abs_val;
+    if (idx > formula.max_var)
+      formula.max_var = idx;
     clause.push_back (val);
   }
 

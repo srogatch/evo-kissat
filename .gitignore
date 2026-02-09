@@ -11,3 +11,4 @@ tissat
 gmon.out
 *~
 .idea/
+/core.*
