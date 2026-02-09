@@ -68,6 +68,33 @@ struct SharedPool {
   size_t max_clauses = 0;
 };
 
+struct ActiveSolvers {
+  std::mutex mutex;
+  std::vector<kissat *> solvers;
+};
+
+static void register_solver (ActiveSolvers &active, kissat *solver) {
+  std::lock_guard<std::mutex> lock (active.mutex);
+  active.solvers.push_back (solver);
+}
+
+static void unregister_solver (ActiveSolvers &active, kissat *solver) {
+  std::lock_guard<std::mutex> lock (active.mutex);
+  for (size_t i = 0; i < active.solvers.size (); i++) {
+    if (active.solvers[i] == solver) {
+      active.solvers[i] = active.solvers.back ();
+      active.solvers.pop_back ();
+      break;
+    }
+  }
+}
+
+static void terminate_active (ActiveSolvers &active) {
+  std::lock_guard<std::mutex> lock (active.mutex);
+  for (kissat *solver : active.solvers)
+    kissat_terminate (solver);
+}
+
 struct EvoOptions {
   bool quiet = false;
   bool witness = true;
@@ -111,6 +138,7 @@ struct Result {
   double elapsed = 0.0;
   bool improved = false;
   bool evaluated = false;
+  bool aborted = false;
 };
 
 struct TerminationState {
@@ -161,7 +189,7 @@ static void print_usage (const char *name) {
   printf ("\n");
   printf ("Evolution options:\n");
   printf ("  --evo-pop=<n>              population size\n");
-  printf ("  --evo-evals=<n>            max evaluations\n");
+  printf ("  --evo-evals=<n>            max evaluations (0 = unlimited)\n");
   printf ("  --evo-conflicts=<n>        alias for --conflicts\n");
   printf ("  --evo-share=<n>            clauses imported per evaluation\n");
   printf ("  --evo-share-out=<n>        clauses exported per evaluation\n");
@@ -552,7 +580,7 @@ static int export_shared_clause (void *state, unsigned size, unsigned glue,
 static Result evaluate_genome (const Genome &g, const Formula &formula,
                                const EvoOptions &opts,
                                const std::vector<GeneSpec> &specs,
-                               SharedPool &pool,
+                               SharedPool &pool, ActiveSolvers &active,
                                std::atomic<bool> &stop,
                                std::atomic<bool> &gen_abort,
                                double deadline, std::mutex &best_mutex,
@@ -564,6 +592,9 @@ static Result evaluate_genome (const Genome &g, const Formula &formula,
   Result res;
   res.genome = g;
   kissat *solver = kissat_init ();
+  register_solver (active, solver);
+  if (stop.load () || gen_abort.load ())
+    kissat_terminate (solver);
   apply_options (solver, opts, g, specs);
   TerminationState term_state;
   term_state.stop = &stop;
@@ -598,6 +629,9 @@ static Result evaluate_genome (const Genome &g, const Formula &formula,
     res.fitness = 1.0 / (1.0 + elapsed);
   }
   res.evaluated = true;
+  res.aborted = gen_abort.load () && status == 0;
+
+  unregister_solver (active, solver);
 
   bool export_it = false;
   {
@@ -634,6 +668,7 @@ static Result evaluate_genome (const Genome &g, const Formula &formula,
       }
     }
     stop.store (true);
+    terminate_active (active);
   } else {
     kissat_release (solver);
   }
@@ -663,8 +698,7 @@ int main (int argc, char **argv) {
     opts.threads = logical_cores;
   if (!opts.population)
     opts.population = opts.threads * 4;
-  if (!opts.max_evals)
-    opts.max_evals = opts.population * 50;
+  // opts.max_evals == 0 means unlimited evaluations.
   if (!opts.evo_seed)
     opts.evo_seed = (unsigned) std::random_device{} ();
 
@@ -696,6 +730,7 @@ int main (int argc, char **argv) {
 
   SharedPool pool;
   pool.max_clauses = opts.share_pool;
+  ActiveSolvers active;
 
   std::atomic<bool> stop (false);
   double deadline = 0.0;
@@ -710,10 +745,11 @@ int main (int argc, char **argv) {
   kissat *solution_solver = nullptr;
   int solution_status = 0;
 
-  unsigned evaluations = 0;
+  uint64_t evaluations = 0;
   unsigned generation = 0;
 
-  while (!stop.load () && evaluations < opts.max_evals) {
+  while (!stop.load () &&
+         (opts.max_evals == 0 || evaluations < opts.max_evals)) {
     const double gen_start = kissat_wall_clock_time ();
     std::vector<Result> results (population.size ());
     for (size_t i = 0; i < population.size (); i++)
@@ -728,8 +764,8 @@ int main (int argc, char **argv) {
     threads.reserve (opts.threads);
 
     if (!opts.quiet) {
-      printf ("c gen %u start pop %zu evals %u\n", generation + 1,
-              population.size (), evaluations);
+      printf ("c gen %u start pop %zu evals %" PRIu64 "\n",
+              generation + 1, population.size (), evaluations);
       fflush (stdout);
     }
 
@@ -773,16 +809,19 @@ int main (int argc, char **argv) {
           if (idx >= population.size ())
             return;
           Result r = evaluate_genome (population[idx], formula, opts,
-                                      specs, pool, stop, gen_abort, deadline,
-                                      best_mutex, best_fitness, best_so_far,
-                                      solution_mutex,
+                                      specs, pool, active, stop, gen_abort,
+                                      deadline, best_mutex, best_fitness,
+                                      best_so_far, solution_mutex,
                                       solution_solver, solution_status);
           results[idx] = std::move (r);
           const size_t done = completed.fetch_add (1) + 1;
           if (allow_cutoff) {
             const size_t remaining = population.size () - done;
-            if (remaining < half_cores)
-              gen_abort.store (true);
+            if (remaining < half_cores) {
+              bool expected = false;
+              if (gen_abort.compare_exchange_strong (expected, true))
+                terminate_active (active);
+            }
           }
         }
       });
@@ -795,13 +834,14 @@ int main (int argc, char **argv) {
       monitor.join ();
 
     const size_t evaluated = completed.load ();
-    evaluations += (unsigned) evaluated;
+    evaluations += evaluated;
     generation++;
 
     if (!opts.quiet) {
       unsigned sat = 0, unsat = 0, unknown = 0, improved = 0;
       size_t evaluated_count = 0;
       size_t skipped = 0;
+      size_t aborted = 0;
       double sum_fitness = 0.0;
       double best_f = 0.0;
       double min_elapsed = 0.0, max_elapsed = 0.0, sum_elapsed = 0.0;
@@ -827,6 +867,8 @@ int main (int argc, char **argv) {
         sum_elapsed += r.elapsed;
         if (r.improved)
           improved++;
+        if (r.aborted)
+          aborted++;
         evaluated_count++;
       }
       const double avg_fitness =
@@ -839,13 +881,13 @@ int main (int argc, char **argv) {
         pool_size = pool.clauses.size ();
       }
       const double gen_end = kissat_wall_clock_time ();
-      printf ("c gen %u evals %u best %.6g avg %.6g "
+      printf ("c gen %u evals %" PRIu64 " best %.6g avg %.6g "
               "sat %u unsat %u unk %u pool %zu "
               "eval_time min %.3f avg %.3f max %.3f "
-              "gen_time %.3f improved %u skipped %zu\n",
+              "gen_time %.3f improved %u skipped %zu aborted %zu\n",
               generation, evaluations, best_f, avg_fitness, sat, unsat,
               unknown, pool_size, min_elapsed, avg_elapsed, max_elapsed,
-              gen_end - gen_start, improved, skipped);
+              gen_end - gen_start, improved, skipped, aborted);
       fflush (stdout);
     }
 
