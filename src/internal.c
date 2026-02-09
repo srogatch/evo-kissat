@@ -274,6 +274,18 @@ uint64_t kissat_get_solver_learned (kissat *solver) {
   return solver->statistics.clauses_learned;
 }
 
+unsigned kissat_get_solver_active_variables (kissat *solver) {
+  kissat_require_initialized (solver);
+  return solver->active;
+}
+
+uint64_t kissat_get_solver_active_clauses (kissat *solver) {
+  kissat_require_initialized (solver);
+  return solver->statistics.clauses_irredundant +
+         solver->statistics.clauses_redundant +
+         solver->statistics.clauses_binary;
+}
+
 void kissat_set_initial_phases (kissat *solver, const int8_t *phases,
                                 unsigned vars) {
   kissat_require_initialized (solver);

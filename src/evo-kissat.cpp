@@ -141,6 +141,8 @@ struct Result {
   bool improved = false;
   bool evaluated = false;
   bool aborted = false;
+  unsigned remaining_vars = 0;
+  uint64_t remaining_clauses = 0;
 };
 
 struct TerminationState {
@@ -704,6 +706,8 @@ static Result evaluate_genome (const Genome &g, const Formula &formula,
   }
   res.evaluated = true;
   res.aborted = gen_abort.load () && status == 0;
+  res.remaining_vars = kissat_get_solver_active_variables (solver);
+  res.remaining_clauses = kissat_get_solver_active_clauses (solver);
 
   unregister_solver (active, solver);
 
@@ -861,10 +865,11 @@ int main (int argc, char **argv) {
             std::lock_guard<std::mutex> lock (pool.mutex);
             pool_size = pool.clauses.size ();
           }
-          const double best = best_so_far.load (std::memory_order_relaxed);
-          printf ("c gen %u progress %zu/%zu best %.6g pool %zu elapsed %.1f\n",
-                  generation + 1, done, population.size (), best, pool_size,
-                  now - gen_start);
+          const double global_best =
+              best_so_far.load (std::memory_order_relaxed);
+          printf ("c gen %u progress %zu/%zu global_best %.6g pool %zu elapsed %.1f\n",
+                  generation + 1, done, population.size (), global_best,
+                  pool_size, now - gen_start);
           fflush (stdout);
           if (done >= population.size ())
             break;
@@ -922,6 +927,8 @@ int main (int argc, char **argv) {
       double sum_fitness = 0.0;
       double best_f = 0.0;
       double min_elapsed = 0.0, max_elapsed = 0.0, sum_elapsed = 0.0;
+      uint64_t sum_vars = 0;
+      uint64_t sum_clauses = 0;
       for (size_t i = 0; i < results.size (); i++) {
         const Result &r = results[i];
         if (!r.evaluated) {
@@ -946,25 +953,36 @@ int main (int argc, char **argv) {
           improved++;
         if (r.aborted)
           aborted++;
+        sum_vars += r.remaining_vars;
+        sum_clauses += r.remaining_clauses;
         evaluated_count++;
       }
       const double avg_fitness =
           evaluated_count ? sum_fitness / evaluated_count : 0.0;
       const double avg_elapsed =
           evaluated_count ? sum_elapsed / evaluated_count : 0.0;
+      const uint64_t avg_vars =
+          evaluated_count ? (sum_vars / evaluated_count) : 0;
+      const uint64_t avg_clauses =
+          evaluated_count ? (sum_clauses / evaluated_count) : 0;
       size_t pool_size = 0;
       {
         std::lock_guard<std::mutex> lock (pool.mutex);
         pool_size = pool.clauses.size ();
       }
       const double gen_end = kissat_wall_clock_time ();
-      printf ("c gen %u evals %" PRIu64 " best %.6g avg %.6g "
+      const double global_best =
+          best_so_far.load (std::memory_order_relaxed);
+      printf ("c gen %u evals %" PRIu64 " gen_best %.6g global_best %.6g avg %.6g "
+              "rem_vars %llu rem_clauses %llu "
               "sat %u unsat %u unk %u pool %zu "
               "eval_time min %.3f avg %.3f max %.3f "
               "gen_time %.3f improved %u skipped %zu aborted %zu\n",
-              generation, evaluations, best_f, avg_fitness, sat, unsat,
-              unknown, pool_size, min_elapsed, avg_elapsed, max_elapsed,
-              gen_end - gen_start, improved, skipped, aborted);
+              generation, evaluations, best_f, global_best, avg_fitness,
+              (unsigned long long) avg_vars,
+              (unsigned long long) avg_clauses, sat, unsat, unknown, pool_size,
+              min_elapsed, avg_elapsed, max_elapsed, gen_end - gen_start,
+              improved, skipped, aborted);
       fflush (stdout);
     }
 
