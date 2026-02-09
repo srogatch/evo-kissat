@@ -50,8 +50,7 @@ uint64_t kissat_get_solver_binary_clauses (kissat *solver);
 uint64_t kissat_get_solver_irredundant_clauses (kissat *solver);
 uint64_t kissat_get_solver_redundant_clauses (kissat *solver);
 double kissat_get_remaining_clause_score (kissat *solver);
-double kissat_get_quadratic_remaining_fitness (kissat *solver,
-                                               unsigned original_variables);
+double kissat_get_remaining_unfitness (kissat *solver);
 // Set initial phases from an external-variable indexed array.
 // `phases[0]` corresponds to external variable 1.
 // Values should be -1 or +1 (0 means "unset").

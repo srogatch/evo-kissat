@@ -6,6 +6,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <random>
 #include <string>
@@ -142,7 +143,7 @@ struct Genome {
 
 struct Result {
   Genome genome;
-  double fitness = 0.0;
+  double unfitness = 0.0;
   int status = 0;
   double elapsed = 0.0;
   bool improved = false;
@@ -672,7 +673,7 @@ static Result evaluate_genome (const Genome &g, const Formula &formula,
                                std::atomic<bool> &stop,
                                std::atomic<bool> &gen_abort,
                                double deadline, std::mutex &best_mutex,
-                               double &best_fitness,
+                               double &best_unfitness,
                                std::atomic<double> &best_so_far,
                                std::mutex &solution_mutex,
                                kissat *&solution_solver,
@@ -743,7 +744,7 @@ static Result evaluate_genome (const Genome &g, const Formula &formula,
   res.elapsed = end - start;
 
   res.status = status;
-  res.fitness = 0.0;
+  res.unfitness = 0.0;
   res.evaluated = true;
   res.aborted = gen_abort.load () && status == 0;
   res.remaining_vars = kissat_get_solver_active_variables (solver);
@@ -751,23 +752,22 @@ static Result evaluate_genome (const Genome &g, const Formula &formula,
   res.remaining_binary = kissat_get_solver_binary_clauses (solver);
 
   if (status == 10 || status == 20)
-    res.fitness = 1e30;
+    res.unfitness = 0.0;
   else
-    res.fitness = kissat_get_quadratic_remaining_fitness (
-        solver, (unsigned) formula.max_var);
+    res.unfitness = kissat_get_remaining_unfitness (solver);
 
   unregister_solver (active, solver);
 
   bool export_it = false;
   {
     std::lock_guard<std::mutex> lock (best_mutex);
-    if (res.fitness > best_fitness) {
-      best_fitness = res.fitness;
-      best_so_far.store (best_fitness, std::memory_order_relaxed);
+    if (res.unfitness < best_unfitness) {
+      best_unfitness = res.unfitness;
+      best_so_far.store (best_unfitness, std::memory_order_relaxed);
       res.improved = true;
       export_it = true;
-    } else if (best_fitness > 0 &&
-               res.fitness >= best_fitness * 0.95) {
+    } else if (best_unfitness > 0 &&
+               res.unfitness <= best_unfitness * 1.05) {
       export_it = true;
     }
   }
@@ -807,7 +807,7 @@ static Genome tournament_select (const std::vector<Result> &results,
   const Result *best = nullptr;
   for (int i = 0; i < 3; i++) {
     const Result &cand = results[dist (rng)];
-    if (!best || cand.fitness > best->fitness)
+    if (!best || cand.unfitness < best->unfitness)
       best = &cand;
   }
   return best->genome;
@@ -864,8 +864,8 @@ int main (int argc, char **argv) {
     deadline = kissat_wall_clock_time () + opts.time_limit;
 
   std::mutex best_mutex;
-  double best_fitness = 0.0;
-  std::atomic<double> best_so_far (0.0);
+  double best_unfitness = std::numeric_limits<double>::infinity ();
+  std::atomic<double> best_so_far (std::numeric_limits<double>::infinity ());
 
   std::mutex solution_mutex;
   kissat *solution_solver = nullptr;
@@ -914,7 +914,7 @@ int main (int argc, char **argv) {
           }
           const double global_best =
               best_so_far.load (std::memory_order_relaxed);
-          printf ("c gen %u progress %zu/%zu global_best %.6g pool %zu elapsed %.1f\n",
+          printf ("c gen %u progress %zu/%zu global_best_unfit %.6g pool %zu elapsed %.1f\n",
                   generation + 1, done, population.size (), global_best,
                   pool_size, now - gen_start);
           fflush (stdout);
@@ -939,7 +939,7 @@ int main (int argc, char **argv) {
             return;
           Result r = evaluate_genome (population[idx], formula, opts,
                                       specs, pool, active, stop, gen_abort,
-                                      deadline, best_mutex, best_fitness,
+                                      deadline, best_mutex, best_unfitness,
                                       best_so_far, solution_mutex,
                                       solution_solver, solution_status);
           results[idx] = std::move (r);
@@ -971,8 +971,8 @@ int main (int argc, char **argv) {
       size_t evaluated_count = 0;
       size_t skipped = 0;
       size_t aborted = 0;
-      double sum_fitness = 0.0;
-      double best_f = 0.0;
+      double sum_unfitness = 0.0;
+      double best_unfit = std::numeric_limits<double>::infinity ();
       double min_elapsed = 0.0, max_elapsed = 0.0, sum_elapsed = 0.0;
       uint64_t sum_vars = 0;
       uint64_t sum_clauses = 0;
@@ -989,9 +989,9 @@ int main (int argc, char **argv) {
           unsat++;
         else
           unknown++;
-        if (r.fitness > best_f)
-          best_f = r.fitness;
-        sum_fitness += r.fitness;
+        if (r.unfitness < best_unfit)
+          best_unfit = r.unfitness;
+        sum_unfitness += r.unfitness;
         if (!evaluated_count || r.elapsed < min_elapsed)
           min_elapsed = r.elapsed;
         if (!evaluated_count || r.elapsed > max_elapsed)
@@ -1006,8 +1006,8 @@ int main (int argc, char **argv) {
         sum_binary += r.remaining_binary;
         evaluated_count++;
       }
-      const double avg_fitness =
-          evaluated_count ? sum_fitness / evaluated_count : 0.0;
+      const double avg_unfitness =
+          evaluated_count ? sum_unfitness / evaluated_count : 0.0;
       const double avg_elapsed =
           evaluated_count ? sum_elapsed / evaluated_count : 0.0;
       const uint64_t avg_vars =
@@ -1024,12 +1024,13 @@ int main (int argc, char **argv) {
       const double gen_end = kissat_wall_clock_time ();
       const double global_best =
           best_so_far.load (std::memory_order_relaxed);
-      printf ("c gen %u evals %" PRIu64 " gen_best %.6g global_best %.6g avg %.6g "
+      printf ("c gen %u evals %" PRIu64
+              " gen_best_unfit %.6g global_best_unfit %.6g avg_unfit %.6g "
               "rem_vars %llu rem_clauses %llu rem_binary %llu "
               "sat %u unsat %u unk %u pool %zu "
               "eval_time min %.3f avg %.3f max %.3f "
               "gen_time %.3f improved %u skipped %zu aborted %zu\n",
-              generation, evaluations, best_f, global_best, avg_fitness,
+              generation, evaluations, best_unfit, global_best, avg_unfitness,
               (unsigned long long) avg_vars,
               (unsigned long long) avg_clauses,
               (unsigned long long) avg_binary, sat, unsat, unknown, pool_size,
@@ -1043,7 +1044,7 @@ int main (int argc, char **argv) {
 
     std::sort (results.begin (), results.end (),
                [] (const Result &a, const Result &b) {
-                 return a.fitness > b.fitness;
+                 return a.unfitness < b.unfitness;
                });
 
     population.clear ();

@@ -25,7 +25,7 @@ static void test_remaining_clause_score_with_invalid_lit (void) {
   kissat_release (solver);
 }
 
-static void test_quadratic_remaining_fitness_formula (void) {
+static void test_remaining_unfitness_formula (void) {
   kissat *solver = kissat_init ();
   tissat_init_solver (solver);
   kissat_reserve (solver, 4);
@@ -45,21 +45,15 @@ static void test_quadratic_remaining_fitness_formula (void) {
   kissat_add (solver, 2);
   kissat_add (solver, 0);
 
-  const double expected = 67.0;
-  const double got = kissat_get_quadratic_remaining_fitness (solver, 4);
+  const double expected = 30.0;
+  const double got = kissat_get_remaining_unfitness (solver);
   if (fabs (got - expected) > 1e-9)
-    FATAL ("expected quadratic fitness %.17g, got %.17g", expected, got);
-
-  const double expected_shifted = 87.0;
-  const double got_shifted = kissat_get_quadratic_remaining_fitness (solver, 6);
-  if (fabs (got_shifted - expected_shifted) > 1e-9)
-    FATAL ("expected shifted quadratic fitness %.17g, got %.17g",
-           expected_shifted, got_shifted);
+    FATAL ("expected unfitness %.17g, got %.17g", expected, got);
 
   kissat_release (solver);
 }
 
 void tissat_schedule_fitness (void) {
   SCHEDULE_FUNCTION (test_remaining_clause_score_with_invalid_lit);
-  SCHEDULE_FUNCTION (test_quadratic_remaining_fitness_formula);
+  SCHEDULE_FUNCTION (test_remaining_unfitness_formula);
 }
