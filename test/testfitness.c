@@ -44,8 +44,15 @@ static void test_remaining_unfitness_formula (void) {
   kissat_add (solver, 4);
   kissat_add (solver, 2);
   kissat_add (solver, 0);
+  // Add a 3-literal redundant clause and ensure it does not affect the
+  // irredundant-only large-clause term in unfitness.
+  const int redundant_clause[3] = {1, 2, 4};
+  const int imported =
+      kissat_import_shared_clause (solver, 3, redundant_clause, 1);
+  if (imported != 1)
+    FATAL ("expected redundant shared clause to be imported, got %d", imported);
 
-  const double expected = 2.0857864376269049;
+  const double expected = 3.5;
   const double got = kissat_get_remaining_unfitness (solver);
   if (fabs (got - expected) > 1e-9)
     FATAL ("expected unfitness %.17g, got %.17g", expected, got);
