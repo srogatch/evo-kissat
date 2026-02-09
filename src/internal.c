@@ -383,6 +383,92 @@ double kissat_get_remaining_clause_score (kissat *solver) {
   return sum;
 }
 
+double kissat_get_quadratic_remaining_fitness (kissat *solver,
+                                               unsigned original_variables) {
+  kissat_require_initialized (solver);
+  value *values = solver->values;
+  double total_literals = 0.0;
+  double clause_penalty = 0.0;
+
+  for (all_clauses (c)) {
+    if (c->garbage)
+      continue;
+    bool satisfied = false;
+    unsigned remaining = 0;
+    for (all_literals_in_clause (lit, c)) {
+      if (lit == INVALID_LIT || lit >= LITS)
+        continue;
+      const value v = values[lit];
+      if (v > 0) {
+        satisfied = true;
+        break;
+      }
+      if (!v)
+        remaining++;
+    }
+    if (satisfied)
+      continue;
+    total_literals += (double) remaining;
+    const int delta = (int) remaining - 1;
+    clause_penalty += (double) delta * (double) delta;
+  }
+
+  // Binary clauses are represented in both watch lists, so each surviving
+  // binary is seen twice while traversing all literals.
+  double binary_literals = 0.0;
+  double binary_penalty = 0.0;
+  if (solver->watching) {
+    for (all_literals (lit)) {
+      watches *watches = &WATCHES (lit);
+      for (all_binary_blocking_watches (watch, *watches)) {
+        if (!watch.type.binary)
+          continue;
+        const unsigned other = watch.binary.lit;
+        if (other == INVALID_LIT || other >= LITS)
+          continue;
+        const value v1 = values[lit];
+        const value v2 = values[other];
+        if (v1 > 0 || v2 > 0)
+          continue;
+        const unsigned remaining = (!v1) + (!v2);
+        binary_literals += (double) remaining;
+        const int delta = (int) remaining - 1;
+        binary_penalty += (double) delta * (double) delta;
+      }
+    }
+  } else {
+    for (all_literals (lit)) {
+      watches *watches = &WATCHES (lit);
+      for (all_binary_large_watches (watch, *watches)) {
+        if (!watch.type.binary)
+          continue;
+        const unsigned other = watch.binary.lit;
+        if (other == INVALID_LIT || other >= LITS)
+          continue;
+        const value v1 = values[lit];
+        const value v2 = values[other];
+        if (v1 > 0 || v2 > 0)
+          continue;
+        const unsigned remaining = (!v1) + (!v2);
+        binary_literals += (double) remaining;
+        const int delta = (int) remaining - 1;
+        binary_penalty += (double) delta * (double) delta;
+      }
+    }
+  }
+
+  total_literals += 0.5 * binary_literals;
+  clause_penalty += 0.5 * binary_penalty;
+
+  const double n_orig_vars = (double) original_variables;
+  const double n_rem_vars = (double) solver->active;
+
+  // Fitness formula:
+  // total_literals^2 - sum((clauseSize_i - 1)^2) + nOrigVars^2 - nRemVars^2
+  return total_literals * total_literals - clause_penalty +
+         n_orig_vars * n_orig_vars - n_rem_vars * n_rem_vars;
+}
+
 void kissat_set_initial_phases (kissat *solver, const int8_t *phases,
                                 unsigned vars) {
   kissat_require_initialized (solver);
