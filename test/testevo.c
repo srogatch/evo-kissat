@@ -1,5 +1,6 @@
 #include "test.h"
 
+#include "../src/import.h"
 #include "../src/literal.h"
 
 #include <signal.h>
@@ -112,8 +113,69 @@ static void test_evo_kissat_rejects_overflowing_literals (void) {
     FATAL ("expected parse failure for overflowing literal, got %d", status);
 }
 
+typedef struct shared_export_stats shared_export_stats;
+
+struct shared_export_stats {
+  int extension_var;
+  unsigned binaries;
+  bool saw_extension_literal;
+};
+
+static int shared_export_consumer (void *state, unsigned size, unsigned glue,
+                                   const int *lits) {
+  (void) glue;
+  shared_export_stats *stats = state;
+  if (size == 2)
+    stats->binaries++;
+  for (unsigned i = 0; i < size; i++)
+    if (ABS (lits[i]) == stats->extension_var)
+      stats->saw_extension_literal = true;
+  return 0;
+}
+
+static void test_shared_export_skips_extension_literals (void) {
+  kissat *solver = kissat_init ();
+  tissat_init_solver (solver);
+
+  kissat_reserve (solver, 2);
+  kissat_add (solver, 1);
+  kissat_add (solver, 2);
+  kissat_add (solver, 0);
+
+  const unsigned extension_lit = kissat_fresh_literal (solver);
+  const int extension_elit = kissat_export_literal (solver, extension_lit);
+  assert (extension_elit);
+
+  const int original_binary[2] = {1, 2};
+  if (kissat_import_shared_clause (solver, 2, original_binary, 1) != 1)
+    FATAL ("expected original binary to be imported");
+
+  const int extension_binary[2] = {1, extension_elit};
+  if (kissat_import_shared_clause (solver, 2, extension_binary, 1) != 1)
+    FATAL ("expected extension binary to be imported locally");
+
+  const int extension_large[3] = {1, 2, extension_elit};
+  if (kissat_import_shared_clause (solver, 3, extension_large, 1) != 1)
+    FATAL ("expected extension large clause to be imported locally");
+
+  shared_export_stats stats;
+  memset (&stats, 0, sizeof stats);
+  stats.extension_var = ABS (extension_elit);
+  kissat_export_shared_clauses (solver, 12, 10, 1000, &stats,
+                                shared_export_consumer);
+
+  if (!stats.binaries)
+    FATAL ("expected at least one shareable original binary clause");
+  if (stats.saw_extension_literal)
+    FATAL ("shared export leaked solver-local extension literal %d",
+           extension_elit);
+
+  kissat_release (solver);
+}
+
 void tissat_schedule_evo (void) {
   SCHEDULE_FUNCTION (test_evo_kissat_f2000);
   SCHEDULE_FUNCTION (test_evo_kissat_rejects_large_literals);
   SCHEDULE_FUNCTION (test_evo_kissat_rejects_overflowing_literals);
+  SCHEDULE_FUNCTION (test_shared_export_skips_extension_literals);
 }

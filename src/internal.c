@@ -401,7 +401,9 @@ static bool shareable_external_literal (kissat *solver, int elit) {
   if (eidx >= SIZE_STACK (solver->import))
     return false;
   const import *const imported = &PEEK_STACK (solver->import, eidx);
-  return imported->imported && !imported->eliminated;
+  // Extension variables are solver-local (their external ids can differ
+  // across instances), so exporting clauses that contain them is unsound.
+  return imported->imported && !imported->eliminated && !imported->extension;
 }
 
 void kissat_set_initial_phases (kissat *solver, const int8_t *phases,
@@ -695,17 +697,7 @@ void kissat_export_shared_clauses (kissat *solver, unsigned max_size,
     unsigned i = 0;
     for (all_literals_in_clause (lit, c)) {
       int elit = kissat_export_literal (solver, lit);
-      if (!elit) {
-        ok = false;
-        break;
-      }
-      const unsigned eidx = ABS (elit);
-      if (eidx >= SIZE_STACK (solver->import)) {
-        ok = false;
-        break;
-      }
-      const import *const import = &PEEK_STACK (solver->import, eidx);
-      if (import->eliminated) {
+      if (!shareable_external_literal (solver, elit)) {
         ok = false;
         break;
       }

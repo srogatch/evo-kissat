@@ -68,9 +68,25 @@ static void print_witness (kissat *solver, int max_var, bool partial) {
 
 struct SharedPool {
   std::mutex mutex;
+  std::unordered_set<int> units;
+  std::unordered_set<uint64_t> binaries;
   std::vector<SharedClause> clauses;
   size_t max_clauses = 0;
 };
+
+static uint64_t encode_binary_key (int a, int b) {
+  if (b < a)
+    std::swap (a, b);
+  const uint32_t lo = (uint32_t) (int32_t) a;
+  const uint32_t hi = (uint32_t) (int32_t) b;
+  return ((uint64_t) lo << 32) | hi;
+}
+
+static std::array<int, 2> decode_binary_key (uint64_t key) {
+  const uint32_t lo = (uint32_t) (key >> 32);
+  const uint32_t hi = (uint32_t) key;
+  return {(int) (int32_t) lo, (int) (int32_t) hi};
+}
 
 struct ActiveSolvers {
   std::mutex mutex;
@@ -200,8 +216,8 @@ static void print_usage (const char *name) {
   printf ("  --evo-pop=<n>              population size\n");
   printf ("  --evo-evals=<n>            max evaluations (0 = unlimited)\n");
   printf ("  --evo-conflicts=<n>        alias for --conflicts\n");
-  printf ("  --evo-share=<n>            clauses imported per evaluation\n");
-  printf ("  --evo-share-out=<n>        clauses exported per evaluation\n");
+  printf ("  --evo-share=<n>            large clauses imported per evaluation\n");
+  printf ("  --evo-share-out=<n>        large clauses exported per evaluation\n");
   printf ("  --evo-share-pool=<n>       shared pool size\n");
   printf ("  --evo-share-size=<n>       max shared clause size\n");
   printf ("  --evo-share-glue=<n>       max shared clause glue\n");
@@ -585,11 +601,20 @@ static void apply_options (kissat *solver, const EvoOptions &opts,
     kissat_set_option (solver, "verbose", opts.verbose);
 }
 
-static void import_shared (kissat *solver, SharedPool &pool,
-                           unsigned limit, std::mt19937 &rng) {
+static void import_shared (kissat *solver, const Formula &formula,
+                           SharedPool &pool, unsigned limit,
+                           std::mt19937 &rng) {
+  std::vector<int> units;
+  std::vector<std::array<int, 2>> binaries;
   std::vector<SharedClause> subset;
   {
     std::lock_guard<std::mutex> lock (pool.mutex);
+    units.reserve (pool.units.size ());
+    for (int lit : pool.units)
+      units.push_back (lit);
+    binaries.reserve (pool.binaries.size ());
+    for (uint64_t key : pool.binaries)
+      binaries.push_back (decode_binary_key (key));
     if (limit && !pool.clauses.empty ()) {
       const size_t n = std::min<size_t> (limit, pool.clauses.size ());
       subset.reserve (n);
@@ -600,6 +625,22 @@ static void import_shared (kissat *solver, SharedPool &pool,
         subset.push_back (pool.clauses[idx]);
       }
     }
+  }
+  // Import all pooled units/binaries into every evaluation. These are the
+  // strongest constraints and should be shared globally across generations.
+  for (int lit : units) {
+    if (std::abs (lit) > formula.max_var)
+      continue;
+    if (kissat_import_shared_clause (solver, 1, &lit, 1) == 2)
+      return;
+  }
+  for (const auto &binary : binaries) {
+    if (std::abs (binary[0]) > formula.max_var ||
+        std::abs (binary[1]) > formula.max_var)
+      continue;
+    const int pair[2] = {binary[0], binary[1]};
+    if (kissat_import_shared_clause (solver, 2, pair, 1) == 2)
+      return;
   }
   for (const auto &cl : subset)
     if (kissat_import_shared_clause (solver, (unsigned) cl.lits.size (),
@@ -616,9 +657,14 @@ struct ExportContext {
 static int export_shared_clause (void *state, unsigned size, unsigned glue,
                                  const int *lits) {
   ExportContext *ctx = static_cast<ExportContext *> (state);
-  if (size <= 2) {
-    // Unit/binary sharing can become stale under aggressive inprocessing.
-    // Only keep larger learned clauses in the cross-solver pool.
+  if (size == 1) {
+    std::lock_guard<std::mutex> lock (ctx->pool->mutex);
+    ctx->pool->units.insert (lits[0]);
+    return 0;
+  }
+  if (size == 2) {
+    std::lock_guard<std::mutex> lock (ctx->pool->mutex);
+    ctx->pool->binaries.insert (encode_binary_key (lits[0], lits[1]));
     return 0;
   }
   SharedClause cl;
@@ -669,7 +715,7 @@ static Result evaluate_genome (const Genome &g, const Formula &formula,
                                (unsigned) g.phases.size ());
 
   std::mt19937 rng (g.seed ^ 0x9e3779b9U);
-  import_shared (solver, pool, opts.share_in, rng);
+  import_shared (solver, formula, pool, opts.share_in, rng);
 
   if (opts.conflicts_limit >= 0)
     kissat_set_conflict_limit (solver, (unsigned) opts.conflicts_limit);
@@ -860,12 +906,6 @@ int main (int argc, char **argv) {
     std::vector<std::thread> threads;
     threads.reserve (opts.threads);
 
-    if (!opts.quiet) {
-      printf ("c gen %u start pop %zu evals %" PRIu64 "\n",
-              generation + 1, population.size (), evaluations);
-      fflush (stdout);
-    }
-
     std::thread monitor;
     if (!opts.quiet) {
       monitor = std::thread ([&] () {
@@ -880,7 +920,8 @@ int main (int argc, char **argv) {
           size_t pool_size = 0;
           {
             std::lock_guard<std::mutex> lock (pool.mutex);
-            pool_size = pool.clauses.size ();
+            pool_size =
+                pool.units.size () + pool.binaries.size () + pool.clauses.size ();
           }
           const double global_best =
               best_so_far.load (std::memory_order_relaxed);
@@ -989,7 +1030,8 @@ int main (int argc, char **argv) {
       size_t pool_size = 0;
       {
         std::lock_guard<std::mutex> lock (pool.mutex);
-        pool_size = pool.clauses.size ();
+        pool_size =
+            pool.units.size () + pool.binaries.size () + pool.clauses.size ();
       }
       const double gen_end = kissat_wall_clock_time ();
       const double global_best =
