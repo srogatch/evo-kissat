@@ -52,7 +52,7 @@ static void test_remaining_unfitness_formula (void) {
   if (imported != 1)
     FATAL ("expected redundant shared clause to be imported, got %d", imported);
 
-  const double expected = 3.5;
+  const double expected = 7.5;
   const double got = kissat_get_remaining_unfitness (solver);
   if (fabs (got - expected) > 1e-9)
     FATAL ("expected unfitness %.17g, got %.17g", expected, got);

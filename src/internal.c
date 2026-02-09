@@ -392,8 +392,8 @@ double kissat_get_remaining_unfitness (kissat *solver) {
       (double) solver->statistics.clauses_irredundant;
 
   // Unfitness formula:
-  // nRemVars - (1 + sqrt(8*nBinaryClauses))/2 + sqrt(nIrredundantClauses3Plus)
-  return n_rem_vars - (1.0 + sqrt (8.0 * n_binary_clauses)) / 2.0 +
+  // 2*nRemVars - (1 + sqrt(8*nBinaryClauses))/2 + sqrt(nIrredundantClauses3Plus)
+  return 2.0 * n_rem_vars - (1.0 + sqrt (8.0 * n_binary_clauses)) / 2.0 +
          sqrt (n_irredundant_large_clauses);
 }
 
