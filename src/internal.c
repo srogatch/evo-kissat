@@ -286,6 +286,97 @@ uint64_t kissat_get_solver_active_clauses (kissat *solver) {
          solver->statistics.clauses_binary;
 }
 
+uint64_t kissat_get_solver_binary_clauses (kissat *solver) {
+  kissat_require_initialized (solver);
+  return solver->statistics.clauses_binary;
+}
+
+uint64_t kissat_get_solver_irredundant_clauses (kissat *solver) {
+  kissat_require_initialized (solver);
+  return solver->statistics.clauses_irredundant;
+}
+
+uint64_t kissat_get_solver_redundant_clauses (kissat *solver) {
+  kissat_require_initialized (solver);
+  return solver->statistics.clauses_redundant;
+}
+
+double kissat_get_remaining_clause_score (kissat *solver) {
+  kissat_require_initialized (solver);
+  value *values = solver->values;
+  double sum = 0.0;
+
+  for (all_clauses (c)) {
+    if (c->garbage)
+      continue;
+    bool satisfied = false;
+    unsigned remaining = 0;
+    for (all_literals_in_clause (lit, c)) {
+      value v = values[lit];
+      if (v > 0) {
+        satisfied = true;
+        break;
+      }
+      if (!v)
+        remaining++;
+    }
+    if (satisfied)
+      continue;
+    if (!remaining)
+      return -1e30;
+    if (remaining < 63) {
+      const double denom = (double) ((1ULL << remaining) - 1ULL);
+      sum += 1.0 / denom;
+    }
+  }
+
+  double binary_sum = 0.0;
+  if (solver->watching) {
+    for (all_literals (lit)) {
+      watches *watches = &WATCHES (lit);
+      for (all_binary_blocking_watches (watch, *watches)) {
+        if (!watch.type.binary)
+          continue;
+        const unsigned other = watch.binary.lit;
+        const value v1 = values[lit];
+        const value v2 = values[other];
+        if (v1 > 0 || v2 > 0)
+          continue;
+        const unsigned remaining = (!v1) + (!v2);
+        if (!remaining)
+          return -1e30;
+        if (remaining < 63) {
+          const double denom = (double) ((1ULL << remaining) - 1ULL);
+          binary_sum += 1.0 / denom;
+        }
+      }
+    }
+  } else {
+    for (all_literals (lit)) {
+      watches *watches = &WATCHES (lit);
+      for (all_binary_large_watches (watch, *watches)) {
+        if (!watch.type.binary)
+          continue;
+        const unsigned other = watch.binary.lit;
+        const value v1 = values[lit];
+        const value v2 = values[other];
+        if (v1 > 0 || v2 > 0)
+          continue;
+        const unsigned remaining = (!v1) + (!v2);
+        if (!remaining)
+          return -1e30;
+        if (remaining < 63) {
+          const double denom = (double) ((1ULL << remaining) - 1ULL);
+          binary_sum += 1.0 / denom;
+        }
+      }
+    }
+  }
+
+  sum += 0.5 * binary_sum;
+  return sum;
+}
+
 void kissat_set_initial_phases (kissat *solver, const int8_t *phases,
                                 unsigned vars) {
   kissat_require_initialized (solver);

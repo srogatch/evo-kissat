@@ -143,6 +143,7 @@ struct Result {
   bool aborted = false;
   unsigned remaining_vars = 0;
   uint64_t remaining_clauses = 0;
+  uint64_t remaining_binary = 0;
 };
 
 struct TerminationState {
@@ -694,20 +695,19 @@ static Result evaluate_genome (const Genome &g, const Formula &formula,
 
   res.status = status;
   res.fitness = 0.0;
-  if (status == 10 || status == 20)
-    res.fitness = 1e30;
-  else {
-    const double elapsed = end - start;
-    const double denom = elapsed > 0 ? elapsed : 1e-9;
-    const uint64_t conflicts = kissat_get_solver_conflicts (solver);
-    const uint64_t learned = kissat_get_solver_learned (solver);
-    const double progress = (double) conflicts + (double) learned;
-    res.fitness = progress / denom;
-  }
   res.evaluated = true;
   res.aborted = gen_abort.load () && status == 0;
   res.remaining_vars = kissat_get_solver_active_variables (solver);
   res.remaining_clauses = kissat_get_solver_active_clauses (solver);
+  res.remaining_binary = kissat_get_solver_binary_clauses (solver);
+
+  if (status == 10 || status == 20)
+    res.fitness = 1e30;
+  else {
+    const double clause_score = kissat_get_remaining_clause_score (solver);
+    res.fitness = std::sqrt(clause_score) - (double) res.remaining_vars +
+                  (double) formula.max_var;
+  }
 
   unregister_solver (active, solver);
 
@@ -929,6 +929,7 @@ int main (int argc, char **argv) {
       double min_elapsed = 0.0, max_elapsed = 0.0, sum_elapsed = 0.0;
       uint64_t sum_vars = 0;
       uint64_t sum_clauses = 0;
+      uint64_t sum_binary = 0;
       for (size_t i = 0; i < results.size (); i++) {
         const Result &r = results[i];
         if (!r.evaluated) {
@@ -955,6 +956,7 @@ int main (int argc, char **argv) {
           aborted++;
         sum_vars += r.remaining_vars;
         sum_clauses += r.remaining_clauses;
+        sum_binary += r.remaining_binary;
         evaluated_count++;
       }
       const double avg_fitness =
@@ -965,6 +967,8 @@ int main (int argc, char **argv) {
           evaluated_count ? (sum_vars / evaluated_count) : 0;
       const uint64_t avg_clauses =
           evaluated_count ? (sum_clauses / evaluated_count) : 0;
+      const uint64_t avg_binary =
+          evaluated_count ? (sum_binary / evaluated_count) : 0;
       size_t pool_size = 0;
       {
         std::lock_guard<std::mutex> lock (pool.mutex);
@@ -974,13 +978,14 @@ int main (int argc, char **argv) {
       const double global_best =
           best_so_far.load (std::memory_order_relaxed);
       printf ("c gen %u evals %" PRIu64 " gen_best %.6g global_best %.6g avg %.6g "
-              "rem_vars %llu rem_clauses %llu "
+              "rem_vars %llu rem_clauses %llu rem_binary %llu "
               "sat %u unsat %u unk %u pool %zu "
               "eval_time min %.3f avg %.3f max %.3f "
               "gen_time %.3f improved %u skipped %zu aborted %zu\n",
               generation, evaluations, best_f, global_best, avg_fitness,
               (unsigned long long) avg_vars,
-              (unsigned long long) avg_clauses, sat, unsat, unknown, pool_size,
+              (unsigned long long) avg_clauses,
+              (unsigned long long) avg_binary, sat, unsat, unknown, pool_size,
               min_elapsed, avg_elapsed, max_elapsed, gen_end - gen_start,
               improved, skipped, aborted);
       fflush (stdout);
