@@ -390,13 +390,15 @@ double kissat_get_remaining_unfitness (kissat *solver) {
   const double n_binary_clauses = (double) solver->statistics.clauses_binary;
   const double n_irredundant_clauses =
       (double) solver->statistics.clauses_irredundant;
-  const double log_irredundant =
-      log2 (n_irredundant_clauses > 1.0 ? n_irredundant_clauses : 1.0);
+  const double irredundant_minus_binary =
+      n_irredundant_clauses - n_binary_clauses;
+  const double log_term = log2 (irredundant_minus_binary > 1.0
+                                    ? irredundant_minus_binary
+                                    : 1.0);
 
   // Unfitness formula:
-  // nRemVars + log2(nIrredundant) - sqrt(nBinary)
-  // Clamp nIrredundant at 1 to keep the score finite when no 3+ clauses remain.
-  return n_rem_vars + log_irredundant - sqrt (n_binary_clauses);
+  // nRemVars + log2(max(1.0, nIrredundant - nBinary)) - sqrt(nBinary)
+  return n_rem_vars + log_term - sqrt (n_binary_clauses);
 }
 
 static bool shareable_external_literal (kissat *solver, int elit) {
