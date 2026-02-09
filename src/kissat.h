@@ -44,6 +44,11 @@ void kissat_set_decision_limit (kissat *solver, unsigned);
 void kissat_print_statistics (kissat *solver);
 uint64_t kissat_get_solver_conflicts (kissat *solver);
 uint64_t kissat_get_solver_learned (kissat *solver);
+// Set initial phases from an external-variable indexed array.
+// `phases[0]` corresponds to external variable 1.
+// Values should be -1 or +1 (0 means "unset").
+void kissat_set_initial_phases (kissat *solver, const int8_t *phases,
+                                unsigned vars);
 
 // Clause sharing between solver instances (portfolio / EA).
 //

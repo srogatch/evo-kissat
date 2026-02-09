@@ -274,6 +274,35 @@ uint64_t kissat_get_solver_learned (kissat *solver) {
   return solver->statistics.clauses_learned;
 }
 
+void kissat_set_initial_phases (kissat *solver, const int8_t *phases,
+                                unsigned vars) {
+  kissat_require_initialized (solver);
+  kissat_require (phases, "phases zero pointer");
+  const size_t imported = SIZE_STACK (solver->import);
+  if (!imported || !vars)
+    return;
+  unsigned limit = vars;
+  if (limit + 1 > imported)
+    limit = (unsigned) imported - 1;
+  for (unsigned eidx = 1; eidx <= limit; eidx++) {
+    const struct import *import = &PEEK_STACK (solver->import, eidx);
+    if (!import->imported || import->eliminated)
+      continue;
+    const unsigned ilit = import->lit;
+    const unsigned iidx = ilit / 2;
+    int8_t v = phases[eidx - 1];
+    if (v > 0)
+      v = 1;
+    else if (v < 0)
+      v = -1;
+    else
+      v = 0;
+    solver->phases.saved[iidx] = (value) v;
+    solver->phases.target[iidx] = (value) v;
+    solver->phases.best[iidx] = (value) v;
+  }
+}
+
 void kissat_add (kissat *solver, int elit) {
   kissat_require_initialized (solver);
   kissat_require (!GET (searches), "incremental solving not supported");

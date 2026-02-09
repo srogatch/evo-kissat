@@ -129,6 +129,7 @@ struct GeneSpec {
 
 struct Genome {
   std::vector<int> values;
+  std::vector<int8_t> phases;
   unsigned seed = 0;
 };
 
@@ -487,7 +488,7 @@ static int mutate_value (const GeneSpec &spec, int base,
 }
 
 static Genome random_genome (const std::vector<GeneSpec> &specs,
-                             const std::vector<int> &base,
+                             const std::vector<int> &base, unsigned vars,
                              std::mt19937 &rng) {
   Genome g;
   g.values = base;
@@ -495,6 +496,10 @@ static Genome random_genome (const std::vector<GeneSpec> &specs,
   for (size_t i = 0; i < specs.size (); i++)
     if (p (rng) < 0.35)
       g.values[i] = mutate_value (specs[i], g.values[i], rng);
+  g.phases.resize (vars);
+  std::bernoulli_distribution b (0.5);
+  for (unsigned i = 0; i < vars; i++)
+    g.phases[i] = b (rng) ? 1 : -1;
   g.seed = rng ();
   return g;
 }
@@ -508,6 +513,16 @@ static Genome crossover (const Genome &a, const Genome &b,
   for (size_t i = 0; i < specs.size (); i++)
     g.values[i] = pick (rng) ? a.values[i] : b.values[i];
   g.seed = pick (rng) ? a.seed : b.seed;
+  const size_t vars = a.phases.size ();
+  g.phases.resize (vars);
+  if (vars) {
+    std::uniform_int_distribution<size_t> split (0, vars);
+    const size_t cut = split (rng);
+    for (size_t i = 0; i < cut; i++)
+      g.phases[i] = a.phases[i];
+    for (size_t i = cut; i < vars; i++)
+      g.phases[i] = b.phases[i];
+  }
   return g;
 }
 
@@ -517,6 +532,19 @@ static void mutate_genome (Genome &g, const std::vector<GeneSpec> &specs,
   for (size_t i = 0; i < specs.size (); i++)
     if (p (rng) < 0.15)
       g.values[i] = mutate_value (specs[i], g.values[i], rng);
+  if (!g.phases.empty ()) {
+    const double phase_mutation_rate = 0.01;
+    for (size_t i = 0; i < g.phases.size (); i++) {
+      if (p (rng) < phase_mutation_rate) {
+        int8_t v = g.phases[i];
+        if (!v)
+          v = p (rng) < 0.5 ? 1 : -1;
+        else
+          v = -v;
+        g.phases[i] = v;
+      }
+    }
+  }
   if (p (rng) < 0.5)
     g.seed = rng ();
 }
@@ -614,6 +642,9 @@ static Result evaluate_genome (const Genome &g, const Formula &formula,
     kissat_reserve (solver, formula.max_var);
   for (int lit : formula.lits)
     kissat_add (solver, lit);
+  if (!g.phases.empty ())
+    kissat_set_initial_phases (solver, g.phases.data (),
+                               (unsigned) g.phases.size ());
 
   std::mt19937 rng (g.seed ^ 0x9e3779b9U);
   import_shared (solver, pool, opts.share_in, rng);
@@ -769,7 +800,8 @@ int main (int argc, char **argv) {
   std::vector<Genome> population;
   population.reserve (opts.population);
   for (unsigned i = 0; i < opts.population; i++)
-    population.push_back (random_genome (specs, base_values, rng));
+    population.push_back (
+        random_genome (specs, base_values, (unsigned) formula.max_var, rng));
 
   SharedPool pool;
   pool.max_clauses = opts.share_pool;
