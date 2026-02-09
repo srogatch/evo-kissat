@@ -11,6 +11,7 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 #include <unistd.h>
@@ -71,6 +72,8 @@ struct SharedPool {
   std::unordered_set<int> units;
   std::unordered_set<uint64_t> binaries;
   std::vector<SharedClause> clauses;
+  std::vector<uint64_t> clause_hashes;
+  std::unordered_map<uint64_t, size_t> clause_positions;
   size_t max_clauses = 0;
 };
 
@@ -86,6 +89,15 @@ static std::array<int, 2> decode_binary_key (uint64_t key) {
   const uint32_t lo = (uint32_t) (key >> 32);
   const uint32_t hi = (uint32_t) key;
   return {(int) (int32_t) lo, (int) (int32_t) hi};
+}
+
+static uint64_t hash_large_clause_lits (const std::vector<int> &lits) {
+  uint64_t hash = 0x9e3779b97f4a7c15ULL ^ (uint64_t) lits.size ();
+  for (int lit : lits) {
+    const uint64_t x = (uint64_t) (uint32_t) (int32_t) lit;
+    hash ^= x + 0x9e3779b97f4a7c15ULL + (hash << 6) + (hash >> 2);
+  }
+  return hash;
 }
 
 struct ActiveSolvers {
@@ -133,7 +145,7 @@ struct EvoOptions {
   unsigned population = 0;
   unsigned max_evals = 0;
   unsigned share_in = 0;
-  unsigned share_out = 200;
+  unsigned share_out = 0;
   unsigned share_pool = 50000000;
   unsigned share_max_size = 12;
   unsigned share_max_glue = 4;
@@ -217,7 +229,7 @@ static void print_usage (const char *name) {
   printf ("  --evo-evals=<n>            max evaluations (0 = unlimited)\n");
   printf ("  --evo-conflicts=<n>        alias for --conflicts\n");
   printf ("  --evo-share=<n>            max large clauses imported per evaluation (0=auto)\n");
-  printf ("  --evo-share-out=<n>        large clauses exported per evaluation\n");
+  printf ("  --evo-share-out=<n>        max large clauses exported per evaluation (0=auto)\n");
   printf ("  --evo-share-pool=<n>       shared pool size\n");
   printf ("  --evo-share-size=<n>       max shared clause size\n");
   printf ("  --evo-share-glue=<n>       max shared clause glue\n");
@@ -619,14 +631,32 @@ static void import_shared (kissat *solver, const Formula &formula,
     if (limit && large_limit > limit)
       large_limit = limit;
     if (large_limit && !pool.clauses.empty ()) {
-      const size_t n = std::min<size_t> (large_limit, pool.clauses.size ());
+      const size_t pool_size = pool.clauses.size ();
+      const size_t n = std::min<size_t> (large_limit, pool_size);
       subset.reserve (n);
-      std::uniform_int_distribution<size_t> dist (0,
-                                                  pool.clauses.size () - 1);
-      for (size_t i = 0; i < n; i++) {
-        const size_t idx = dist (rng);
-        subset.push_back (pool.clauses[idx]);
+      if (n == pool_size) {
+        subset = pool.clauses;
+      } else {
+        const bool use_complement = n > pool_size / 2;
+        const size_t picked = use_complement ? (pool_size - n) : n;
+        std::unordered_set<size_t> indices;
+        indices.reserve (picked * 2 + 1);
+        for (size_t j = pool_size - picked; j < pool_size; j++) {
+          std::uniform_int_distribution<size_t> dist (0, j);
+          const size_t cand = dist (rng);
+          if (!indices.insert (cand).second)
+            indices.insert (j);
+        }
+        if (!use_complement) {
+          for (size_t idx : indices)
+            subset.push_back (pool.clauses[idx]);
+        } else {
+          for (size_t idx = 0; idx < pool_size; idx++)
+            if (!indices.count (idx))
+              subset.push_back (pool.clauses[idx]);
+        }
       }
+      std::shuffle (subset.begin (), subset.end (), rng);
     }
   }
   // Import all pooled units/binaries into every evaluation. These are the
@@ -673,13 +703,29 @@ static int export_shared_clause (void *state, unsigned size, unsigned glue,
   SharedClause cl;
   cl.glue = glue;
   cl.lits.assign (lits, lits + size);
+  std::sort (cl.lits.begin (), cl.lits.end ());
+  const uint64_t hash = hash_large_clause_lits (cl.lits);
   std::lock_guard<std::mutex> lock (ctx->pool->mutex);
+  auto found = ctx->pool->clause_positions.find (hash);
+  if (found != ctx->pool->clause_positions.end ()) {
+    SharedClause &existing = ctx->pool->clauses[found->second];
+    if (cl.glue < existing.glue)
+      existing = std::move (cl);
+    return 0;
+  }
   if (ctx->pool->clauses.size () < ctx->max_pool) {
     ctx->pool->clauses.push_back (std::move (cl));
+    ctx->pool->clause_hashes.push_back (hash);
+    ctx->pool->clause_positions[hash] = ctx->pool->clauses.size () - 1;
   } else if (!ctx->pool->clauses.empty ()) {
     std::uniform_int_distribution<size_t> dist (
         0, ctx->pool->clauses.size () - 1);
-    ctx->pool->clauses[dist (*ctx->rng)] = std::move (cl);
+    const size_t idx = dist (*ctx->rng);
+    const uint64_t old_hash = ctx->pool->clause_hashes[idx];
+    ctx->pool->clause_positions.erase (old_hash);
+    ctx->pool->clauses[idx] = std::move (cl);
+    ctx->pool->clause_hashes[idx] = hash;
+    ctx->pool->clause_positions[hash] = idx;
   }
   return 0;
 }
@@ -796,8 +842,19 @@ static Result evaluate_genome (const Genome &g, const Formula &formula,
     ctx.pool = &pool;
     ctx.max_pool = opts.share_pool;
     ctx.rng = &rng;
+    size_t large_export_limit =
+        (size_t) kissat_get_solver_irredundant_clauses (solver);
+    const size_t population =
+        opts.population ? (size_t) opts.population : (size_t) 1;
+    large_export_limit /= population;
+    if (opts.share_out && large_export_limit > opts.share_out)
+      large_export_limit = opts.share_out;
+    const size_t max_export = (size_t) std::numeric_limits<unsigned>::max ();
+    if (large_export_limit > max_export)
+      large_export_limit = max_export;
     kissat_export_shared_clauses (solver, opts.share_max_size,
-                                  opts.share_max_glue, opts.share_out,
+                                  opts.share_max_glue,
+                                  (unsigned) large_export_limit,
                                   &ctx, export_shared_clause);
   }
 
