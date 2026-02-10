@@ -75,6 +75,7 @@ static void test_evo_kissat_f2000 (void) {
       "--evo-evals=32",
       "--evo-pop=16",
       "--evo-threads=4",
+      "--evo-eval-time=0.1",
       "--conflicts=500",
       cnf,
       0,

@@ -1,10 +1,12 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cctype>
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -214,7 +216,7 @@ struct EvoOptions {
   int conflicts_limit = 100000;
   int decisions_limit = -1;
   int time_limit = 0;
-  int eval_time_limit = 10;
+  double eval_time_limit = 0.1;
   std::string input_path;
   std::string config;
   std::vector<std::pair<std::string, int>> overrides;
@@ -295,7 +297,7 @@ static void print_usage (const char *name) {
   printf ("  -s                         print complete statistics\n");
   printf ("  -v                         increase verbosity\n");
   printf ("  --partial                  print partial witness\n");
-  printf ("  --conflicts=<limit>        per-evaluation conflict limit (default: remaining unknown vars)\n");
+  printf ("  --conflicts=<limit>        per-evaluation conflict limit (default: ceil(sqrt(active clauses)))\n");
   printf ("  --decisions=<limit>        per-evaluation decision limit\n");
   printf ("  --time=<seconds>           global time limit\n");
   printf ("  --<option>=<value>         set Kissat option\n");
@@ -310,7 +312,7 @@ static void print_usage (const char *name) {
   printf ("  --evo-share-pool=<n>       shared pool size\n");
   printf ("  --evo-share-size=<n>       max shared clause size\n");
   printf ("  --evo-share-glue=<n>       max shared clause glue\n");
-  printf ("  --evo-eval-time=<n>        per-evaluation time budget (seconds, 0 = no limit)\n");
+  printf ("  --evo-eval-time=<seconds>  per-evaluation time budget (default: 0.1, 0 = no limit)\n");
   printf ("  --evo-threads=<n>          worker threads\n");
   printf ("  --evo-seed=<n>             RNG seed\n");
 }
@@ -321,6 +323,20 @@ static bool parse_int_option (const char *arg, const char *name, int &out) {
     return false;
   int tmp = 0;
   if (!kissat_parse_option_value (val, &tmp))
+    return false;
+  out = tmp;
+  return true;
+}
+
+static bool parse_double_option (const char *arg, const char *name,
+                                 double &out) {
+  const char *val = kissat_parse_option_name (arg, name);
+  if (!val || !*val)
+    return false;
+  errno = 0;
+  char *end = nullptr;
+  const double tmp = std::strtod (val, &end);
+  if (errno == ERANGE || !end || *end || !std::isfinite (tmp))
     return false;
   out = tmp;
   return true;
@@ -379,7 +395,8 @@ static bool parse_args (int argc, char **argv, EvoOptions &opts) {
         ;
       else if (parse_uint_option (arg, "evo-share-glue", opts.share_max_glue))
         ;
-      else if (parse_int_option (arg, "evo-eval-time", opts.eval_time_limit))
+      else if (parse_double_option (arg, "evo-eval-time",
+                                    opts.eval_time_limit))
         ;
       else if (parse_uint_option (arg, "evo-threads", opts.threads))
         ;
@@ -417,7 +434,8 @@ static bool parse_args (int argc, char **argv, EvoOptions &opts) {
     continue;
   }
   if (opts.eval_time_limit < 0) {
-    fprintf (stderr, "invalid --evo-eval-time=%d\n", opts.eval_time_limit);
+    fprintf (stderr, "invalid --evo-eval-time=%.17g\n",
+             opts.eval_time_limit);
     return false;
   }
   return true;
@@ -812,7 +830,7 @@ static Result evaluate_genome (const Genome &g, const Formula &formula,
                                std::atomic<bool> &stop, double deadline,
                                int conflicts_limit, bool conflicts_from_active,
                                unsigned conflicts_divisor, int decisions_limit,
-                               int eval_time_limit, unsigned eval_seed,
+                               double eval_time_limit, unsigned eval_seed,
                                std::mutex &solution_mutex,
                                kissat *&solution_solver,
                                int &solution_status) {
@@ -840,28 +858,32 @@ static Result evaluate_genome (const Genome &g, const Formula &formula,
   std::mt19937 import_rng (eval_seed ^ 0x9e3779b9U);
   import_shared (solver, formula, import_pool, opts.share_in, import_rng);
 
-  const unsigned active_limit = kissat_get_solver_active_variables (solver);
-  const double conflict_factor = log2 ((double) active_limit + 2.0);
+  const uint64_t active_clauses = kissat_get_solver_active_clauses (solver);
   const unsigned divisor = conflicts_divisor ? conflicts_divisor : 1;
-  auto boosted_conflicts = [&](unsigned base_limit) {
+  auto scaled_conflicts = [&](unsigned base_limit) {
     unsigned scaled_limit = base_limit / divisor;
     if (base_limit && !scaled_limit)
       scaled_limit = 1;
-    if (!scaled_limit)
+    return scaled_limit;
+  };
+  auto sqrt_clause_budget = [&] () {
+    if (!active_clauses)
       return 0u;
-    const double boosted =
-        ceil ((double) scaled_limit * conflict_factor);
-    const double max_unsigned =
-        (double) std::numeric_limits<unsigned>::max ();
-    if (boosted >= max_unsigned)
+    const long double raw = ceill (sqrtl ((long double) active_clauses));
+    if (raw <= 0.0L)
+      return 1u;
+    const long double max_unsigned =
+        (long double) std::numeric_limits<unsigned>::max ();
+    if (raw >= max_unsigned)
       return std::numeric_limits<unsigned>::max ();
-    return (unsigned) boosted;
+    return (unsigned) raw;
   };
   if (conflicts_from_active) {
-    kissat_set_conflict_limit (solver, boosted_conflicts (active_limit));
+    kissat_set_conflict_limit (solver,
+                               scaled_conflicts (sqrt_clause_budget ()));
   } else if (conflicts_limit >= 0) {
     const unsigned base_limit = (unsigned) conflicts_limit;
-    kissat_set_conflict_limit (solver, boosted_conflicts (base_limit));
+    kissat_set_conflict_limit (solver, scaled_conflicts (base_limit));
   }
   if (decisions_limit >= 0)
     kissat_set_decision_limit (solver, (unsigned) decisions_limit);
@@ -963,7 +985,7 @@ static size_t run_evaluation_stage (
     SharedPool *export_pool, ActiveSolvers &active, std::atomic<bool> &stop,
     double deadline, int conflicts_limit, bool conflicts_from_active,
     unsigned conflicts_divisor, int decisions_limit,
-    int eval_time_limit, unsigned eval_seed,
+    double eval_time_limit, unsigned eval_seed,
     std::atomic<double> &global_best_hint, std::mutex &solution_mutex,
     kissat *&solution_solver, int &solution_status) {
   if (indices.empty () || stop.load ())
@@ -1135,21 +1157,16 @@ int main (int argc, char **argv) {
       all_indices.push_back (i);
 
     const bool default_conflicts = !opts.conflicts_limit_set;
-    int screen_eval_time = opts.eval_time_limit;
+    double screen_eval_time = opts.eval_time_limit;
     if (screen_eval_time <= 0)
-      screen_eval_time = 2;
-    else {
-      screen_eval_time /= 4;
-      if (screen_eval_time < 1)
-        screen_eval_time = 1;
-    }
+      screen_eval_time = 0.1;
 
     // Stage 1: fast screening over the whole population.
     const unsigned screen_seed = rng ();
     evaluations += run_evaluation_stage (
         generation, "screen", all_indices, population, results, formula, opts,
         specs, pool, nullptr, active, stop, deadline, opts.conflicts_limit,
-        default_conflicts, 4, opts.decisions_limit, screen_eval_time,
+        default_conflicts, 1, opts.decisions_limit, screen_eval_time,
         screen_seed, best_so_far, solution_mutex, solution_solver,
         solution_status);
 
@@ -1209,14 +1226,9 @@ int main (int argc, char **argv) {
     if (!stop.load () && reeval_indices.size () > 1) {
       // Re-evaluate the top subset on extra shared seeds and average
       // unfitness to reduce lucky-seed selection.
-      int reeval_eval_time = opts.eval_time_limit;
+      double reeval_eval_time = opts.eval_time_limit;
       if (reeval_eval_time <= 0)
-        reeval_eval_time = 2;
-      else {
-        reeval_eval_time /= 2;
-        if (reeval_eval_time < 1)
-          reeval_eval_time = 1;
-      }
+        reeval_eval_time = 0.1;
 
       const unsigned extra_passes = 2;
       std::vector<double> sums (reeval_indices.size (), 0.0);
@@ -1237,7 +1249,7 @@ int main (int argc, char **argv) {
         evaluations += run_evaluation_stage (
             generation, "reeval", reeval_indices, population, pass_results,
             formula, opts, specs, pool, nullptr, active, stop, deadline,
-            opts.conflicts_limit, default_conflicts, 2, opts.decisions_limit,
+            opts.conflicts_limit, default_conflicts, 1, opts.decisions_limit,
             reeval_eval_time, pass_seed, best_so_far, solution_mutex,
             solution_solver, solution_status);
         for (size_t i = 0; i < reeval_indices.size (); i++) {
@@ -1274,7 +1286,7 @@ int main (int argc, char **argv) {
     best_so_far.store (best_unfitness, std::memory_order_relaxed);
 
     if (!opts.quiet) {
-      unsigned sat = 0, unsat = 0, unknown = 0, improved = 0;
+      unsigned improved = 0;
       size_t evaluated_count = 0;
       size_t skipped = 0;
       size_t aborted = 0;
@@ -1290,12 +1302,6 @@ int main (int argc, char **argv) {
           skipped++;
           continue;
         }
-        if (r.status == 10)
-          sat++;
-        else if (r.status == 20)
-          unsat++;
-        else
-          unknown++;
         if (r.unfitness < best_unfit)
           best_unfit = r.unfitness;
         sum_unfitness += r.unfitness;
@@ -1332,18 +1338,17 @@ int main (int argc, char **argv) {
       const double gen_end = kissat_wall_clock_time ();
       const double global_best =
           best_so_far.load (std::memory_order_relaxed);
-      printf ("c gen %u evals %" PRIu64
-              " gen_best_unfit %.6g global_best_unfit %.6g avg_unfit %.6g "
-              "rem_vars %llu rem_irred %llu rem_binary %llu "
-              "sat %u unsat %u unk %u pool %zu "
-              "eval_time min %.3f avg %.3f max %.3f "
-              "gen_time %.3f improved %u skipped %zu aborted %zu\n",
+      printf ("c gen=%u evals=%" PRIu64
+              " bestUnfit: gen=%.6g global=%.6g avgUnfit=%.6g "
+              "remVars=%llu remIrred=%llu remBinary=%llu pool=%zu "
+              "evalTime: min=%.3f avg=%.3f max=%.3f "
+              "genTime=%.3f improved %u skipped %zu aborted %zu\n",
               generation, evaluations, best_unfit, global_best, avg_unfitness,
               (unsigned long long) avg_vars,
               (unsigned long long) avg_irredundant,
-              (unsigned long long) avg_binary, sat, unsat, unknown, pool_size,
-              min_elapsed, avg_elapsed, max_elapsed, gen_end - gen_start,
-              improved, skipped, aborted);
+              (unsigned long long) avg_binary, pool_size, min_elapsed,
+              avg_elapsed, max_elapsed, gen_end - gen_start, improved, skipped,
+              aborted);
       fflush (stdout);
     }
 
