@@ -68,7 +68,7 @@ static void print_witness (kissat *solver, int max_var, bool partial) {
 }
 
 struct SharedPool {
-  std::mutex mutex;
+  mutable std::mutex mutex;
   std::unordered_set<int> units;
   std::unordered_set<uint64_t> binaries;
   std::vector<SharedClause> clauses;
@@ -115,6 +115,66 @@ static void remove_bucket_index (std::unordered_map<uint64_t, std::vector<size_t
   }
   if (bucket.empty ())
     buckets.erase (it);
+}
+
+static void atomic_min_relaxed (std::atomic<double> &target, double value) {
+  double current = target.load (std::memory_order_relaxed);
+  while (value < current &&
+         !target.compare_exchange_weak (current, value,
+                                        std::memory_order_relaxed))
+    ;
+}
+
+static void insert_large_clause_locked (SharedPool &pool, SharedClause &&cl,
+                                        uint64_t hash, std::mt19937 &rng) {
+  auto found_bucket = pool.clause_buckets.find (hash);
+  if (found_bucket != pool.clause_buckets.end ()) {
+    for (size_t idx : found_bucket->second) {
+      SharedClause &existing = pool.clauses[idx];
+      if (existing.lits != cl.lits)
+        continue;
+      if (cl.glue < existing.glue)
+        existing = std::move (cl);
+      return;
+    }
+  }
+
+  if (!pool.max_clauses)
+    return;
+
+  if (pool.clauses.size () < pool.max_clauses) {
+    pool.clauses.push_back (std::move (cl));
+    pool.clause_hashes.push_back (hash);
+    pool.clause_buckets[hash].push_back (pool.clauses.size () - 1);
+    return;
+  }
+
+  if (pool.clauses.empty ())
+    return;
+
+  std::uniform_int_distribution<size_t> dist (0, pool.clauses.size () - 1);
+  const size_t idx = dist (rng);
+  const uint64_t old_hash = pool.clause_hashes[idx];
+  remove_bucket_index (pool.clause_buckets, old_hash, idx);
+  pool.clauses[idx] = std::move (cl);
+  pool.clause_hashes[idx] = hash;
+  pool.clause_buckets[hash].push_back (idx);
+}
+
+static void merge_shared_pool (SharedPool &dst, const SharedPool &src,
+                               std::mt19937 &rng) {
+  std::lock_guard<std::mutex> dst_lock (dst.mutex);
+  for (int lit : src.units)
+    dst.units.insert (lit);
+  for (uint64_t key : src.binaries)
+    dst.binaries.insert (key);
+  for (const SharedClause &cl : src.clauses) {
+    SharedClause copy;
+    copy.glue = cl.glue;
+    copy.lits = cl.lits;
+    const uint64_t hash = hash_large_clause_lits (copy.lits);
+    insert_large_clause_locked (dst, std::move (copy), hash, rng);
+  }
 }
 
 struct ActiveSolvers {
@@ -180,12 +240,11 @@ struct GeneSpec {
 struct Genome {
   std::vector<int> values;
   std::vector<int8_t> phases;
-  unsigned seed = 0;
 };
 
 struct Result {
   Genome genome;
-  double unfitness = 0.0;
+  double unfitness = std::numeric_limits<double>::infinity ();
   int status = 0;
   double elapsed = 0.0;
   bool improved = false;
@@ -567,7 +626,6 @@ static Genome random_genome (const std::vector<GeneSpec> &specs,
   std::bernoulli_distribution b (0.5);
   for (unsigned i = 0; i < vars; i++)
     g.phases[i] = b (rng) ? 1 : -1;
-  g.seed = rng ();
   return g;
 }
 
@@ -579,7 +637,6 @@ static Genome crossover (const Genome &a, const Genome &b,
   std::uniform_int_distribution<int> pick (0, 1);
   for (size_t i = 0; i < specs.size (); i++)
     g.values[i] = pick (rng) ? a.values[i] : b.values[i];
-  g.seed = pick (rng) ? a.seed : b.seed;
   const size_t vars = a.phases.size ();
   g.phases.resize (vars);
   if (vars) {
@@ -612,20 +669,19 @@ static void mutate_genome (Genome &g, const std::vector<GeneSpec> &specs,
       }
     }
   }
-  if (p (rng) < 0.5)
-    g.seed = rng ();
 }
 
 static void apply_options (kissat *solver, const EvoOptions &opts,
                            const Genome &g,
-                           const std::vector<GeneSpec> &specs) {
+                           const std::vector<GeneSpec> &specs,
+                           unsigned eval_seed) {
   if (!opts.config.empty ())
     kissat_set_configuration (solver, opts.config.c_str ());
   for (const auto &ov : opts.overrides)
     kissat_set_option (solver, ov.first.c_str (), ov.second);
   for (size_t i = 0; i < specs.size (); i++)
     kissat_set_option (solver, specs[i].option->name, g.values[i]);
-  kissat_set_option (solver, "seed", (int) g.seed);
+  kissat_set_option (solver, "seed", (int) eval_seed);
   kissat_set_option (solver, "quiet", 1);
   if (opts.statistics)
     kissat_set_option (solver, "statistics", 1);
@@ -634,7 +690,7 @@ static void apply_options (kissat *solver, const EvoOptions &opts,
 }
 
 static void import_shared (kissat *solver, const Formula &formula,
-                           SharedPool &pool, unsigned limit,
+                           const SharedPool &pool, unsigned limit,
                            std::mt19937 &rng) {
   std::vector<int> units;
   std::vector<std::array<int, 2>> binaries;
@@ -647,7 +703,14 @@ static void import_shared (kissat *solver, const Formula &formula,
     binaries.reserve (pool.binaries.size ());
     for (uint64_t key : pool.binaries)
       binaries.push_back (decode_binary_key (key));
-    size_t large_limit = (size_t) kissat_get_solver_irredundant_clauses (solver);
+    const size_t irredundant =
+        (size_t) kissat_get_solver_irredundant_clauses (solver);
+    // Keep imported 3+ clauses selective to preserve diversity.
+    size_t large_limit = irredundant / 8 + 1;
+    if (large_limit < 64)
+      large_limit = 64;
+    if (large_limit > 4096)
+      large_limit = 4096;
     if (limit && large_limit > limit)
       large_limit = limit;
     if (large_limit && !pool.clauses.empty ()) {
@@ -715,7 +778,6 @@ static void import_shared (kissat *solver, const Formula &formula,
 
 struct ExportContext {
   SharedPool *pool;
-  size_t max_pool;
   std::mt19937 *rng;
 };
 
@@ -738,43 +800,18 @@ static int export_shared_clause (void *state, unsigned size, unsigned glue,
   std::sort (cl.lits.begin (), cl.lits.end ());
   const uint64_t hash = hash_large_clause_lits (cl.lits);
   std::lock_guard<std::mutex> lock (ctx->pool->mutex);
-  auto found_bucket = ctx->pool->clause_buckets.find (hash);
-  if (found_bucket != ctx->pool->clause_buckets.end ()) {
-    for (size_t idx : found_bucket->second) {
-      SharedClause &existing = ctx->pool->clauses[idx];
-      if (existing.lits != cl.lits)
-        continue;
-      if (cl.glue < existing.glue)
-        existing = std::move (cl);
-      return 0;
-    }
-  }
-  if (ctx->pool->clauses.size () < ctx->max_pool) {
-    ctx->pool->clauses.push_back (std::move (cl));
-    ctx->pool->clause_hashes.push_back (hash);
-    ctx->pool->clause_buckets[hash].push_back (ctx->pool->clauses.size () - 1);
-  } else if (!ctx->pool->clauses.empty ()) {
-    std::uniform_int_distribution<size_t> dist (
-        0, ctx->pool->clauses.size () - 1);
-    const size_t idx = dist (*ctx->rng);
-    const uint64_t old_hash = ctx->pool->clause_hashes[idx];
-    remove_bucket_index (ctx->pool->clause_buckets, old_hash, idx);
-    ctx->pool->clauses[idx] = std::move (cl);
-    ctx->pool->clause_hashes[idx] = hash;
-    ctx->pool->clause_buckets[hash].push_back (idx);
-  }
+  insert_large_clause_locked (*ctx->pool, std::move (cl), hash, *ctx->rng);
   return 0;
 }
 
 static Result evaluate_genome (const Genome &g, const Formula &formula,
                                const EvoOptions &opts,
                                const std::vector<GeneSpec> &specs,
-                               SharedPool &pool, ActiveSolvers &active,
-                               std::atomic<bool> &stop,
-                               std::atomic<bool> &gen_abort,
-                               double deadline, std::mutex &best_mutex,
-                               double &best_unfitness,
-                               std::atomic<double> &best_so_far,
+                               const SharedPool &import_pool,
+                               SharedPool *export_pool, ActiveSolvers &active,
+                               std::atomic<bool> &stop, double deadline,
+                               int conflicts_limit, int decisions_limit,
+                               int eval_time_limit, unsigned eval_seed,
                                std::mutex &solution_mutex,
                                kissat *&solution_solver,
                                int &solution_status) {
@@ -782,12 +819,12 @@ static Result evaluate_genome (const Genome &g, const Formula &formula,
   res.genome = g;
   kissat *solver = kissat_init ();
   register_solver (active, solver);
-  if (stop.load () || gen_abort.load ())
+  if (stop.load ())
     kissat_terminate (solver);
-  apply_options (solver, opts, g, specs);
+  apply_options (solver, opts, g, specs, eval_seed);
   TerminationState term_state;
   term_state.stop = &stop;
-  term_state.abort = &gen_abort;
+  term_state.abort = nullptr;
   term_state.deadline = deadline;
   kissat_set_terminate (solver, &term_state, terminate_cb);
 
@@ -799,21 +836,21 @@ static Result evaluate_genome (const Genome &g, const Formula &formula,
     kissat_set_initial_phases (solver, g.phases.data (),
                                (unsigned) g.phases.size ());
 
-  std::mt19937 rng (g.seed ^ 0x9e3779b9U);
-  import_shared (solver, formula, pool, opts.share_in, rng);
+  std::mt19937 import_rng (eval_seed ^ 0x9e3779b9U);
+  import_shared (solver, formula, import_pool, opts.share_in, import_rng);
 
-  if (opts.conflicts_limit >= 0)
-    kissat_set_conflict_limit (solver, (unsigned) opts.conflicts_limit);
-  if (opts.decisions_limit >= 0)
-    kissat_set_decision_limit (solver, (unsigned) opts.decisions_limit);
+  if (conflicts_limit >= 0)
+    kissat_set_conflict_limit (solver, (unsigned) conflicts_limit);
+  if (decisions_limit >= 0)
+    kissat_set_decision_limit (solver, (unsigned) decisions_limit);
 
   const double start = kissat_wall_clock_time ();
   std::atomic<bool> eval_done (false);
   std::thread eval_timer;
-  if (opts.eval_time_limit > 0 || deadline > 0) {
+  if (eval_time_limit > 0 || deadline > 0) {
     double until = 0.0;
-    if (opts.eval_time_limit > 0)
-      until = start + opts.eval_time_limit;
+    if (eval_time_limit > 0)
+      until = start + eval_time_limit;
     if (deadline > 0 && (until == 0.0 || deadline < until))
       until = deadline;
     eval_timer = std::thread ([&] () {
@@ -844,9 +881,8 @@ static Result evaluate_genome (const Genome &g, const Formula &formula,
   res.elapsed = end - start;
 
   res.status = status;
-  res.unfitness = 0.0;
   res.evaluated = true;
-  res.aborted = gen_abort.load () && status == 0;
+  res.aborted = stop.load () && status == 0;
   res.remaining_vars = kissat_get_solver_active_variables (solver);
   res.remaining_clauses = kissat_get_solver_active_clauses (solver);
   res.remaining_binary = kissat_get_solver_binary_clauses (solver);
@@ -858,31 +894,14 @@ static Result evaluate_genome (const Genome &g, const Formula &formula,
 
   unregister_solver (active, solver);
 
-  bool export_it = false;
-  {
-    std::lock_guard<std::mutex> lock (best_mutex);
-    if (res.unfitness < best_unfitness) {
-      best_unfitness = res.unfitness;
-      best_so_far.store (best_unfitness, std::memory_order_relaxed);
-      res.improved = true;
-      export_it = true;
-    } else {
-      const double tolerance = std::max (1e-9, std::fabs (best_unfitness) * 0.05);
-      if (res.unfitness <= best_unfitness + tolerance)
-        export_it = true;
-    }
-  }
-
-  if (export_it) {
+  if (export_pool && status == 0 && !res.aborted) {
     ExportContext ctx;
-    ctx.pool = &pool;
-    ctx.max_pool = opts.share_pool;
-    ctx.rng = &rng;
+    ctx.pool = export_pool;
+    std::mt19937 export_rng (eval_seed ^ 0xa5a5a5a5U ^
+                             (unsigned) res.remaining_vars);
+    ctx.rng = &export_rng;
     size_t large_export_limit =
         (size_t) kissat_get_solver_irredundant_clauses (solver);
-    const size_t population =
-        opts.population ? (size_t) opts.population : (size_t) 1;
-    large_export_limit /= population;
     if (opts.share_out && large_export_limit > opts.share_out)
       large_export_limit = opts.share_out;
     const size_t max_export = (size_t) std::numeric_limits<unsigned>::max ();
@@ -913,9 +932,97 @@ static Result evaluate_genome (const Genome &g, const Formula &formula,
   return res;
 }
 
+static size_t run_evaluation_stage (
+    unsigned generation, const char *stage_name, const std::vector<size_t> &indices,
+    const std::vector<Genome> &population, std::vector<Result> &results,
+    const Formula &formula, const EvoOptions &opts,
+    const std::vector<GeneSpec> &specs, const SharedPool &import_pool,
+    SharedPool *export_pool, ActiveSolvers &active, std::atomic<bool> &stop,
+    double deadline, int conflicts_limit, int decisions_limit,
+    int eval_time_limit, unsigned eval_seed,
+    std::atomic<double> &global_best_hint, std::mutex &solution_mutex,
+    kissat *&solution_solver, int &solution_status) {
+  if (indices.empty () || stop.load ())
+    return 0;
+
+  std::atomic<size_t> next (0);
+  std::atomic<size_t> completed (0);
+  std::atomic<bool> stage_done (false);
+  std::atomic<double> stage_best (std::numeric_limits<double>::infinity ());
+  const double stage_start = kissat_wall_clock_time ();
+
+  std::thread monitor;
+  if (!opts.quiet) {
+    monitor = std::thread ([&] () {
+      double last = kissat_wall_clock_time ();
+      while (!stage_done.load ()) {
+        std::this_thread::sleep_for (std::chrono::milliseconds (200));
+        const double now = kissat_wall_clock_time ();
+        if (now - last < 10.0)
+          continue;
+        last = now;
+        const size_t done = completed.load ();
+        size_t pool_size = 0;
+        {
+          std::lock_guard<std::mutex> lock (import_pool.mutex);
+          pool_size = import_pool.units.size () + import_pool.binaries.size () +
+                      import_pool.clauses.size ();
+        }
+        const double best = stage_best.load (std::memory_order_relaxed);
+        const double global_best =
+            global_best_hint.load (std::memory_order_relaxed);
+        const double shown_best = std::min (best, global_best);
+        printf ("c gen %u %s %zu/%zu best_unfit %.6g global_best_unfit %.6g pool %zu elapsed %.1f\n",
+                generation, stage_name, done, indices.size (), shown_best,
+                global_best, pool_size, now - stage_start);
+        fflush (stdout);
+        if (done >= indices.size ())
+          break;
+      }
+    });
+  }
+
+  std::vector<std::thread> threads;
+  threads.reserve (opts.threads);
+  for (unsigned t = 0; t < opts.threads; t++) {
+    threads.emplace_back ([&] () {
+      for (;;) {
+        if (stop.load ())
+          return;
+        if (deadline > 0 && kissat_wall_clock_time () >= deadline) {
+          stop.store (true);
+          terminate_active (active);
+          return;
+        }
+        const size_t pos = next.fetch_add (1);
+        if (pos >= indices.size ())
+          return;
+        const size_t idx = indices[pos];
+        Result r = evaluate_genome (population[idx], formula, opts, specs,
+                                    import_pool, export_pool, active, stop,
+                                    deadline, conflicts_limit, decisions_limit,
+                                    eval_time_limit, eval_seed, solution_mutex,
+                                    solution_solver, solution_status);
+        results[idx] = std::move (r);
+        if (results[idx].evaluated)
+          atomic_min_relaxed (stage_best, results[idx].unfitness);
+        completed.fetch_add (1);
+      }
+    });
+  }
+
+  for (auto &th : threads)
+    th.join ();
+  stage_done.store (true);
+  if (monitor.joinable ())
+    monitor.join ();
+
+  return completed.load ();
+}
+
 static Genome tournament_select (const std::vector<Result> &results,
-                                 std::mt19937 &rng) {
-  std::uniform_int_distribution<size_t> dist (0, results.size () - 1);
+                                 size_t limit, std::mt19937 &rng) {
+  std::uniform_int_distribution<size_t> dist (0, limit - 1);
   const Result *best = nullptr;
   for (int i = 0; i < 3; i++) {
     const Result &cand = results[dist (rng)];
@@ -980,7 +1087,6 @@ int main (int argc, char **argv) {
   if (opts.time_limit > 0)
     deadline = kissat_wall_clock_time () + opts.time_limit;
 
-  std::mutex best_mutex;
   double best_unfitness = std::numeric_limits<double>::infinity ();
   std::atomic<double> best_so_far (std::numeric_limits<double>::infinity ());
 
@@ -993,90 +1099,169 @@ int main (int argc, char **argv) {
 
   while (!stop.load () &&
          (opts.max_evals == 0 || evaluations < opts.max_evals)) {
+    generation++;
     const double gen_start = kissat_wall_clock_time ();
     std::vector<Result> results (population.size ());
     for (size_t i = 0; i < population.size (); i++)
       results[i].genome = population[i];
-    std::atomic<size_t> next (0);
-    std::atomic<size_t> completed (0);
-    std::atomic<bool> gen_done (false);
-    std::atomic<bool> gen_abort (false);
-    const unsigned half_cores = std::max (1u, logical_cores / 2);
-    const bool allow_cutoff =
-        (opts.eval_time_limit == 0) && population.size () >= half_cores;
-    std::vector<std::thread> threads;
-    threads.reserve (opts.threads);
+    // Keep the global pool immutable during this generation to avoid
+    // order-dependent fitness noise; export into a generation-local pool.
+    SharedPool generation_exports;
+    generation_exports.max_clauses = opts.share_pool;
 
-    std::thread monitor;
-    if (!opts.quiet) {
-      monitor = std::thread ([&] () {
-        double last = kissat_wall_clock_time ();
-        while (!gen_done.load ()) {
-          std::this_thread::sleep_for (std::chrono::milliseconds (200));
-          const double now = kissat_wall_clock_time ();
-          if (now - last < 10.0)
+    std::vector<size_t> all_indices;
+    all_indices.reserve (population.size ());
+    for (size_t i = 0; i < population.size (); i++)
+      all_indices.push_back (i);
+
+    int screen_conflicts = opts.conflicts_limit;
+    if (screen_conflicts >= 0) {
+      screen_conflicts /= 4;
+      if (screen_conflicts < 1)
+        screen_conflicts = 1;
+    }
+    int screen_eval_time = opts.eval_time_limit;
+    if (screen_eval_time <= 0)
+      screen_eval_time = 2;
+    else {
+      screen_eval_time /= 4;
+      if (screen_eval_time < 1)
+        screen_eval_time = 1;
+    }
+
+    // Stage 1: fast screening over the whole population.
+    const unsigned screen_seed = rng ();
+    evaluations += run_evaluation_stage (
+        generation, "screen", all_indices, population, results, formula, opts,
+        specs, pool, nullptr, active, stop, deadline, screen_conflicts,
+        opts.decisions_limit, screen_eval_time, screen_seed, best_so_far,
+        solution_mutex, solution_solver, solution_status);
+
+    std::vector<size_t> ranked_stage1;
+    ranked_stage1.reserve (results.size ());
+    for (size_t i = 0; i < results.size (); i++)
+      if (results[i].evaluated)
+        ranked_stage1.push_back (i);
+    std::sort (ranked_stage1.begin (), ranked_stage1.end (),
+               [&](size_t a, size_t b) {
+                 return results[a].unfitness < results[b].unfitness;
+               });
+
+    const size_t pop_size = population.size ();
+    size_t elite_count_hint =
+        pop_size == 1 ? 1
+                      : std::min<size_t> (8, std::max<size_t> (2, pop_size / 16));
+    if (elite_count_hint > pop_size)
+      elite_count_hint = pop_size;
+
+    size_t full_count = ranked_stage1.size () / 3;
+    const size_t min_full =
+        std::min<size_t> (pop_size, std::max<size_t> (opts.threads, elite_count_hint * 2));
+    if (full_count < min_full)
+      full_count = min_full;
+    if (full_count > ranked_stage1.size ())
+      full_count = ranked_stage1.size ();
+
+    std::vector<size_t> full_indices;
+    full_indices.reserve (full_count);
+    for (size_t i = 0; i < full_count; i++)
+      full_indices.push_back (ranked_stage1[i]);
+
+    if (!stop.load () && !full_indices.empty ()) {
+      // Stage 2: full-budget evaluation only for top screened candidates.
+      const unsigned full_seed = rng ();
+      evaluations += run_evaluation_stage (
+          generation, "full", full_indices, population, results, formula, opts,
+          specs, pool, &generation_exports, active, stop, deadline,
+          opts.conflicts_limit, opts.decisions_limit, opts.eval_time_limit,
+          full_seed, best_so_far, solution_mutex, solution_solver,
+          solution_status);
+    }
+
+    std::vector<size_t> reeval_indices = full_indices;
+    std::sort (reeval_indices.begin (), reeval_indices.end (),
+               [&](size_t a, size_t b) {
+                 return results[a].unfitness < results[b].unfitness;
+               });
+    size_t reeval_count = std::min<size_t> (8, reeval_indices.size ());
+    if (reeval_count > 0) {
+      if (reeval_count == 1 && reeval_indices.size () > 1)
+        reeval_count = 2;
+      reeval_indices.resize (reeval_count);
+    }
+
+    if (!stop.load () && reeval_indices.size () > 1) {
+      // Re-evaluate the top subset on extra shared seeds and average
+      // unfitness to reduce lucky-seed selection.
+      int reeval_conflicts = opts.conflicts_limit;
+      if (reeval_conflicts >= 0) {
+        reeval_conflicts /= 2;
+        if (reeval_conflicts < 1)
+          reeval_conflicts = 1;
+      }
+      int reeval_eval_time = opts.eval_time_limit;
+      if (reeval_eval_time <= 0)
+        reeval_eval_time = 2;
+      else {
+        reeval_eval_time /= 2;
+        if (reeval_eval_time < 1)
+          reeval_eval_time = 1;
+      }
+
+      const unsigned extra_passes = 2;
+      std::vector<double> sums (reeval_indices.size (), 0.0);
+      std::vector<unsigned> counts (reeval_indices.size (), 0);
+      for (size_t i = 0; i < reeval_indices.size (); i++) {
+        const size_t idx = reeval_indices[i];
+        if (results[idx].evaluated) {
+          sums[i] = results[idx].unfitness;
+          counts[i] = 1;
+        }
+      }
+
+      for (unsigned pass = 0; pass < extra_passes && !stop.load (); pass++) {
+        std::vector<Result> pass_results (population.size ());
+        for (size_t idx : reeval_indices)
+          pass_results[idx].genome = population[idx];
+        const unsigned pass_seed = rng ();
+        evaluations += run_evaluation_stage (
+            generation, "reeval", reeval_indices, population, pass_results,
+            formula, opts, specs, pool, nullptr, active, stop, deadline,
+            reeval_conflicts, opts.decisions_limit, reeval_eval_time,
+            pass_seed, best_so_far, solution_mutex, solution_solver,
+            solution_status);
+        for (size_t i = 0; i < reeval_indices.size (); i++) {
+          const size_t idx = reeval_indices[i];
+          const Result &rr = pass_results[idx];
+          if (!rr.evaluated)
             continue;
-          last = now;
-          const size_t done = completed.load ();
-          size_t pool_size = 0;
-          {
-            std::lock_guard<std::mutex> lock (pool.mutex);
-            pool_size =
-                pool.units.size () + pool.binaries.size () + pool.clauses.size ();
-          }
-          const double global_best =
-              best_so_far.load (std::memory_order_relaxed);
-          printf ("c gen %u progress %zu/%zu global_best_unfit %.6g pool %zu elapsed %.1f\n",
-                  generation + 1, done, population.size (), global_best,
-                  pool_size, now - gen_start);
-          fflush (stdout);
-          if (done >= population.size ())
-            break;
+          sums[i] += rr.unfitness;
+          counts[i]++;
+          if (!results[idx].evaluated || rr.unfitness < results[idx].unfitness)
+            results[idx] = rr;
         }
-      });
+      }
+
+      for (size_t i = 0; i < reeval_indices.size (); i++) {
+        const size_t idx = reeval_indices[i];
+        if (counts[i])
+          results[idx].unfitness = sums[i] / counts[i];
+      }
     }
 
-    for (unsigned t = 0; t < opts.threads; t++) {
-      threads.emplace_back ([&] () {
-        for (;;) {
-          if (stop.load () || gen_abort.load ())
-            return;
-          if (deadline > 0 && kissat_wall_clock_time () >= deadline) {
-            stop.store (true);
-            terminate_active (active);
-            return;
-          }
-          size_t idx = next.fetch_add (1);
-          if (idx >= population.size ())
-            return;
-          Result r = evaluate_genome (population[idx], formula, opts,
-                                      specs, pool, active, stop, gen_abort,
-                                      deadline, best_mutex, best_unfitness,
-                                      best_so_far, solution_mutex,
-                                      solution_solver, solution_status);
-          results[idx] = std::move (r);
-          const size_t done = completed.fetch_add (1) + 1;
-          if (allow_cutoff) {
-            const size_t remaining = population.size () - done;
-            if (remaining < half_cores) {
-              bool expected = false;
-              if (gen_abort.compare_exchange_strong (expected, true))
-                terminate_active (active);
-            }
-          }
-        }
-      });
+    if (!stop.load ())
+      // Apply all exports at generation boundary.
+      merge_shared_pool (pool, generation_exports, rng);
+
+    for (Result &r : results) {
+      if (!r.evaluated)
+        continue;
+      if (r.unfitness < best_unfitness) {
+        best_unfitness = r.unfitness;
+        r.improved = true;
+      }
     }
-
-    for (auto &th : threads)
-      th.join ();
-    gen_done.store (true);
-    if (monitor.joinable ())
-      monitor.join ();
-
-    const size_t evaluated = completed.load ();
-    evaluations += evaluated;
-    generation++;
+    best_so_far.store (best_unfitness, std::memory_order_relaxed);
 
     if (!opts.quiet) {
       unsigned sat = 0, unsat = 0, unknown = 0, improved = 0;
@@ -1160,16 +1345,56 @@ int main (int argc, char **argv) {
                  return a.unfitness < b.unfitness;
                });
 
-    population.clear ();
-    population.reserve (opts.population);
-    population.push_back (results.front ().genome);
-    while (population.size () < opts.population) {
-      Genome a = tournament_select (results, rng);
-      Genome b = tournament_select (results, rng);
+    size_t ranked_count = 0;
+    while (ranked_count < results.size () && results[ranked_count].evaluated)
+      ranked_count++;
+
+    if (!ranked_count) {
+      population.clear ();
+      population.reserve (opts.population);
+      for (unsigned i = 0; i < opts.population; i++) {
+        population.push_back (random_genome (specs, base_values,
+                                             (unsigned) formula.max_var, rng));
+      }
+      continue;
+    }
+
+    size_t elite_count = pop_size == 1
+                             ? 1
+                             : std::min<size_t> (
+                                   8, std::max<size_t> (2, pop_size / 16));
+    if (elite_count > ranked_count)
+      elite_count = ranked_count;
+
+    size_t immigrant_count = 0;
+    if (pop_size > elite_count) {
+      immigrant_count = std::max<size_t> (1, pop_size / 10);
+      const size_t max_immigrants = pop_size - elite_count;
+      if (immigrant_count > max_immigrants)
+        immigrant_count = max_immigrants;
+    }
+
+    size_t parent_limit = std::max<size_t> (elite_count, (ranked_count * 3) / 4);
+    if (ranked_count >= 2 && parent_limit < 2)
+      parent_limit = 2;
+    if (parent_limit > ranked_count)
+      parent_limit = ranked_count;
+
+    std::vector<Genome> next_population;
+    next_population.reserve (opts.population);
+    for (size_t i = 0; i < elite_count; i++)
+      next_population.push_back (results[i].genome);
+    for (size_t i = 0; i < immigrant_count; i++)
+      next_population.push_back (random_genome (specs, base_values,
+                                                (unsigned) formula.max_var, rng));
+    while (next_population.size () < opts.population) {
+      Genome a = tournament_select (results, parent_limit, rng);
+      Genome b = tournament_select (results, parent_limit, rng);
       Genome child = crossover (a, b, specs, rng);
       mutate_genome (child, specs, rng);
-      population.push_back (std::move (child));
+      next_population.push_back (std::move (child));
     }
+    population.swap (next_population);
   }
 
   int status = solution_status ? solution_status : 0;

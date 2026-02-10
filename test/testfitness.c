@@ -58,7 +58,7 @@ static void test_remaining_unfitness_formula (void) {
     FATAL ("expected redundant shared clause to be imported, got %d", imported);
 
   // 'clauses_irredundant' tracks irredundant non-binary clauses.
-  const double expected = 4.0 - sqrt (1.0) + sqrt (3.0);
+  const double expected = 4.0 - sqrt (1.0) + log2 (3.0 + 1.0);
   const double got = kissat_get_remaining_unfitness (solver);
   if (fabs (got - expected) > 1e-9)
     FATAL ("expected unfitness %.17g, got %.17g", expected, got);
