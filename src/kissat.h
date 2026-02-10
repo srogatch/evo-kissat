@@ -49,6 +49,9 @@ uint64_t kissat_get_solver_active_clauses (kissat *solver);
 uint64_t kissat_get_solver_binary_clauses (kissat *solver);
 uint64_t kissat_get_solver_irredundant_clauses (kissat *solver);
 uint64_t kissat_get_solver_redundant_clauses (kissat *solver);
+uint64_t kissat_get_solver_deduplicated_active_clauses (kissat *solver);
+uint64_t kissat_get_solver_deduplicated_binary_clauses (kissat *solver);
+uint64_t kissat_get_solver_deduplicated_irredundant_clauses (kissat *solver);
 double kissat_get_remaining_clause_score (kissat *solver);
 double kissat_get_remaining_unfitness (kissat *solver);
 // Set initial phases from an external-variable indexed array.

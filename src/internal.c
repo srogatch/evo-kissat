@@ -17,6 +17,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 void kissat_reset_last_learned (kissat *solver) {
   for (really_all_last_learned (p))
@@ -384,17 +385,296 @@ double kissat_get_remaining_clause_score (kissat *solver) {
   return sum;
 }
 
+typedef struct deduplicated_clause_signature {
+  unsigned size;
+  unsigned *lits;
+} deduplicated_clause_signature;
+
+static int compare_uint64_values (const void *a, const void *b) {
+  const uint64_t x = *(const uint64_t *) a;
+  const uint64_t y = *(const uint64_t *) b;
+  if (x < y)
+    return -1;
+  if (x > y)
+    return 1;
+  return 0;
+}
+
+static int compare_unsigned_values (const void *a, const void *b) {
+  const unsigned x = *(const unsigned *) a;
+  const unsigned y = *(const unsigned *) b;
+  if (x < y)
+    return -1;
+  if (x > y)
+    return 1;
+  return 0;
+}
+
+static int compare_clause_signatures (const void *a, const void *b) {
+  const deduplicated_clause_signature *x =
+      (const deduplicated_clause_signature *) a;
+  const deduplicated_clause_signature *y =
+      (const deduplicated_clause_signature *) b;
+  if (x->size < y->size)
+    return -1;
+  if (x->size > y->size)
+    return 1;
+  if (!x->size)
+    return 0;
+  const int cmp =
+      memcmp (x->lits, y->lits, x->size * sizeof *x->lits);
+  if (cmp < 0)
+    return -1;
+  if (cmp > 0)
+    return 1;
+  return 0;
+}
+
+static void push_uint64_key (kissat *solver, uint64_t **keys_ptr,
+                             size_t *size_ptr, size_t *capacity_ptr,
+                             uint64_t key) {
+  size_t size = *size_ptr;
+  size_t capacity = *capacity_ptr;
+  uint64_t *keys = *keys_ptr;
+  if (size == capacity) {
+    const size_t max_capacity = SIZE_MAX / sizeof *keys;
+    size_t new_capacity = capacity ? 2 * capacity : 1;
+    if (new_capacity > max_capacity)
+      new_capacity = max_capacity;
+    if (new_capacity <= capacity)
+      return;
+    keys = kissat_nrealloc (solver, keys, capacity, new_capacity,
+                            sizeof *keys);
+    capacity = new_capacity;
+    *keys_ptr = keys;
+    *capacity_ptr = capacity;
+  }
+  keys[size++] = key;
+  *size_ptr = size;
+}
+
+static uint64_t deduplicated_binary_clause_count (kissat *solver) {
+  size_t capacity = (size_t) solver->statistics.clauses_binary;
+  if (!capacity)
+    return 0;
+  uint64_t *keys = kissat_nalloc (solver, capacity, sizeof *keys);
+  size_t size = 0;
+
+  // Binary clauses are represented by symmetric watches. Keep one
+  // orientation (lit <= other) and deduplicate exact pairs afterward.
+  if (solver->watching) {
+    for (all_literals (lit)) {
+      watches *watches = &WATCHES (lit);
+      for (all_binary_blocking_watches (watch, *watches)) {
+        if (!watch.type.binary)
+          continue;
+        const unsigned other = watch.binary.lit;
+        if (other == INVALID_LIT || other >= LITS)
+          continue;
+        if (lit > other)
+          continue;
+        const uint64_t key = ((uint64_t) lit << 32) | (uint64_t) other;
+        push_uint64_key (solver, &keys, &size, &capacity, key);
+      }
+    }
+  } else {
+    for (all_literals (lit)) {
+      watches *watches = &WATCHES (lit);
+      for (all_binary_large_watches (watch, *watches)) {
+        if (!watch.type.binary)
+          continue;
+        const unsigned other = watch.binary.lit;
+        if (other == INVALID_LIT || other >= LITS)
+          continue;
+        if (lit > other)
+          continue;
+        const uint64_t key = ((uint64_t) lit << 32) | (uint64_t) other;
+        push_uint64_key (solver, &keys, &size, &capacity, key);
+      }
+    }
+  }
+
+  if (!size) {
+    kissat_dealloc (solver, keys, capacity, sizeof *keys);
+    return 0;
+  }
+
+  qsort (keys, size, sizeof *keys, compare_uint64_values);
+  uint64_t unique = 1;
+  for (size_t i = 1; i < size; i++)
+    if (keys[i] != keys[i - 1])
+      unique++;
+
+  kissat_dealloc (solver, keys, capacity, sizeof *keys);
+  return unique;
+}
+
+static uint64_t deduplicated_irredundant_large_clause_count (kissat *solver) {
+  size_t clauses = 0;
+  size_t total_literals = 0;
+  for (all_clauses (c)) {
+    if (c->garbage || c->redundant || c->size < 3)
+      continue;
+    clauses++;
+    if (SIZE_MAX - total_literals < c->size)
+      return solver->statistics.clauses_irredundant;
+    total_literals += c->size;
+  }
+  if (!clauses)
+    return 0;
+
+  deduplicated_clause_signature *signatures =
+      kissat_nalloc (solver, clauses, sizeof *signatures);
+  unsigned *literal_pool =
+      kissat_nalloc (solver, total_literals, sizeof *literal_pool);
+
+  size_t idx = 0;
+  unsigned *next = literal_pool;
+  for (all_clauses (c)) {
+    if (c->garbage || c->redundant || c->size < 3)
+      continue;
+    signatures[idx].size = c->size;
+    signatures[idx].lits = next;
+    memcpy (next, c->lits, c->size * sizeof *next);
+    qsort (next, c->size, sizeof *next, compare_unsigned_values);
+    next += c->size;
+    idx++;
+  }
+  assert (idx == clauses);
+
+  // Deduplicate irredundant 3+ clauses by full sorted literal signature.
+  qsort (signatures, clauses, sizeof *signatures, compare_clause_signatures);
+  uint64_t unique = 1;
+  for (size_t i = 1; i < clauses; i++)
+    if (compare_clause_signatures (&signatures[i - 1], &signatures[i]))
+      unique++;
+
+  kissat_dealloc (solver, literal_pool, total_literals, sizeof *literal_pool);
+  kissat_dealloc (solver, signatures, clauses, sizeof *signatures);
+  return unique;
+}
+
+uint64_t kissat_get_solver_deduplicated_binary_clauses (kissat *solver) {
+  kissat_require_initialized (solver);
+  return deduplicated_binary_clause_count (solver);
+}
+
+uint64_t kissat_get_solver_deduplicated_irredundant_clauses (kissat *solver) {
+  kissat_require_initialized (solver);
+  return deduplicated_irredundant_large_clause_count (solver);
+}
+
+uint64_t kissat_get_solver_deduplicated_active_clauses (kissat *solver) {
+  kissat_require_initialized (solver);
+  const uint64_t binary = deduplicated_binary_clause_count (solver);
+  const uint64_t irredundant =
+      deduplicated_irredundant_large_clause_count (solver);
+  const uint64_t redundant = solver->statistics.clauses_redundant;
+  if (UINT64_MAX - binary < irredundant)
+    return UINT64_MAX;
+  const uint64_t sum = binary + irredundant;
+  if (UINT64_MAX - sum < redundant)
+    return UINT64_MAX;
+  return sum + redundant;
+}
+
 double kissat_get_remaining_unfitness (kissat *solver) {
   kissat_require_initialized (solver);
-  const double n_rem_vars = (double) solver->active;
-  const double n_binary_clauses_plus_one =
-      (double) solver->statistics.clauses_binary + 1.0;
-  const double n_irredundant_clauses =
-      (double) solver->statistics.clauses_irredundant;
+  const value *const values = solver->values;
+  double sum = (double) solver->active;
 
-  // Unfitness formula:
-  // nRemVars + nIrredundant / sqrt(nBinary + 1)
-  return n_rem_vars + n_irredundant_clauses / sqrt (n_binary_clauses_plus_one);
+  // For a clause with 'k' unknown literals, add log2(1 - 2^-k).
+  // Empty clauses (k = 0) are ignored by request.
+#define ADD_CLAUSE_TERM(REMAINING) \
+  do { \
+    const unsigned k = (REMAINING); \
+    if (k) \
+      sum += log2 (1.0 - exp2 (-(double) k)); \
+  } while (0)
+
+  for (all_clauses (c)) {
+    if (c->garbage)
+      continue;
+    bool satisfied = false;
+    unsigned remaining = 0;
+    for (all_literals_in_clause (lit, c)) {
+      if (lit == INVALID_LIT || lit >= LITS)
+        continue;
+      const value v = values[lit];
+      if (v > 0) {
+        satisfied = true;
+        break;
+      }
+      if (!v)
+        remaining++;
+    }
+    if (!satisfied)
+      ADD_CLAUSE_TERM (remaining);
+  }
+
+  if (solver->watching) {
+    for (all_literals (lit)) {
+      watches *watches = &WATCHES (lit);
+      for (all_binary_blocking_watches (watch, *watches)) {
+        if (!watch.type.binary)
+          continue;
+        const unsigned other = watch.binary.lit;
+        if (other == INVALID_LIT || other >= LITS)
+          continue;
+        // Count each binary clause once (not once per watch direction).
+        if (lit > other)
+          continue;
+        const value v1 = values[lit];
+        const value v2 = values[other];
+        if (v1 > 0 || v2 > 0)
+          continue;
+        const unsigned remaining = (!v1) + (!v2);
+        ADD_CLAUSE_TERM (remaining);
+      }
+    }
+  } else {
+    for (all_literals (lit)) {
+      watches *watches = &WATCHES (lit);
+      for (all_binary_large_watches (watch, *watches)) {
+        if (!watch.type.binary)
+          continue;
+        const unsigned other = watch.binary.lit;
+        if (other == INVALID_LIT || other >= LITS)
+          continue;
+        // Count each binary clause once (not once per watch direction).
+        if (lit > other)
+          continue;
+        const value v1 = values[lit];
+        const value v2 = values[other];
+        if (v1 > 0 || v2 > 0)
+          continue;
+        const unsigned remaining = (!v1) + (!v2);
+        ADD_CLAUSE_TERM (remaining);
+      }
+    }
+  }
+
+  for (all_stack (int, elit, solver->units)) {
+    const unsigned eidx = ABS (elit);
+    if (eidx >= SIZE_STACK (solver->import))
+      continue;
+    const import *const imported = &PEEK_STACK (solver->import, eidx);
+    if (!imported->imported || imported->eliminated)
+      continue;
+    unsigned ilit = imported->lit;
+    if (elit < 0)
+      ilit = NOT (ilit);
+    if (ilit >= LITS)
+      continue;
+    const value v = values[ilit];
+    if (v > 0)
+      continue;
+    const unsigned remaining = !v;
+    ADD_CLAUSE_TERM (remaining);
+  }
+
+#undef ADD_CLAUSE_TERM
+  return sum;
 }
 
 static bool shareable_external_literal (kissat *solver, int elit) {

@@ -251,7 +251,7 @@ struct Result {
   bool evaluated = false;
   bool aborted = false;
   unsigned remaining_vars = 0;
-  uint64_t remaining_clauses = 0;
+  uint64_t remaining_irredundant = 0;
   uint64_t remaining_binary = 0;
 };
 
@@ -840,19 +840,28 @@ static Result evaluate_genome (const Genome &g, const Formula &formula,
   std::mt19937 import_rng (eval_seed ^ 0x9e3779b9U);
   import_shared (solver, formula, import_pool, opts.share_in, import_rng);
 
+  const unsigned active_limit = kissat_get_solver_active_variables (solver);
+  const double conflict_factor = log2 ((double) active_limit + 2.0);
   const unsigned divisor = conflicts_divisor ? conflicts_divisor : 1;
-  if (conflicts_from_active) {
-    const unsigned active_limit = kissat_get_solver_active_variables (solver);
-    unsigned scaled_limit = active_limit / divisor;
-    if (active_limit && !scaled_limit)
-      scaled_limit = 1;
-    kissat_set_conflict_limit (solver, scaled_limit);
-  } else if (conflicts_limit >= 0) {
-    const unsigned base_limit = (unsigned) conflicts_limit;
+  auto boosted_conflicts = [&](unsigned base_limit) {
     unsigned scaled_limit = base_limit / divisor;
     if (base_limit && !scaled_limit)
       scaled_limit = 1;
-    kissat_set_conflict_limit (solver, scaled_limit);
+    if (!scaled_limit)
+      return 0u;
+    const double boosted =
+        ceil ((double) scaled_limit * conflict_factor);
+    const double max_unsigned =
+        (double) std::numeric_limits<unsigned>::max ();
+    if (boosted >= max_unsigned)
+      return std::numeric_limits<unsigned>::max ();
+    return (unsigned) boosted;
+  };
+  if (conflicts_from_active) {
+    kissat_set_conflict_limit (solver, boosted_conflicts (active_limit));
+  } else if (conflicts_limit >= 0) {
+    const unsigned base_limit = (unsigned) conflicts_limit;
+    kissat_set_conflict_limit (solver, boosted_conflicts (base_limit));
   }
   if (decisions_limit >= 0)
     kissat_set_decision_limit (solver, (unsigned) decisions_limit);
@@ -897,8 +906,9 @@ static Result evaluate_genome (const Genome &g, const Formula &formula,
   res.evaluated = true;
   res.aborted = stop.load () && status == 0;
   res.remaining_vars = kissat_get_solver_active_variables (solver);
-  res.remaining_clauses = kissat_get_solver_active_clauses (solver);
-  res.remaining_binary = kissat_get_solver_binary_clauses (solver);
+  res.remaining_irredundant =
+      kissat_get_solver_deduplicated_irredundant_clauses (solver);
+  res.remaining_binary = kissat_get_solver_deduplicated_binary_clauses (solver);
 
   if (status == 10 || status == 20)
     res.unfitness = 0.0;
@@ -1272,7 +1282,7 @@ int main (int argc, char **argv) {
       double best_unfit = std::numeric_limits<double>::infinity ();
       double min_elapsed = 0.0, max_elapsed = 0.0, sum_elapsed = 0.0;
       uint64_t sum_vars = 0;
-      uint64_t sum_clauses = 0;
+      uint64_t sum_irredundant = 0;
       uint64_t sum_binary = 0;
       for (size_t i = 0; i < results.size (); i++) {
         const Result &r = results[i];
@@ -1299,7 +1309,7 @@ int main (int argc, char **argv) {
         if (r.aborted)
           aborted++;
         sum_vars += r.remaining_vars;
-        sum_clauses += r.remaining_clauses;
+        sum_irredundant += r.remaining_irredundant;
         sum_binary += r.remaining_binary;
         evaluated_count++;
       }
@@ -1309,8 +1319,8 @@ int main (int argc, char **argv) {
           evaluated_count ? sum_elapsed / evaluated_count : 0.0;
       const uint64_t avg_vars =
           evaluated_count ? (sum_vars / evaluated_count) : 0;
-      const uint64_t avg_clauses =
-          evaluated_count ? (sum_clauses / evaluated_count) : 0;
+      const uint64_t avg_irredundant =
+          evaluated_count ? (sum_irredundant / evaluated_count) : 0;
       const uint64_t avg_binary =
           evaluated_count ? (sum_binary / evaluated_count) : 0;
       size_t pool_size = 0;
@@ -1324,13 +1334,13 @@ int main (int argc, char **argv) {
           best_so_far.load (std::memory_order_relaxed);
       printf ("c gen %u evals %" PRIu64
               " gen_best_unfit %.6g global_best_unfit %.6g avg_unfit %.6g "
-              "rem_vars %llu rem_clauses %llu rem_binary %llu "
+              "rem_vars %llu rem_irred %llu rem_binary %llu "
               "sat %u unsat %u unk %u pool %zu "
               "eval_time min %.3f avg %.3f max %.3f "
               "gen_time %.3f improved %u skipped %zu aborted %zu\n",
               generation, evaluations, best_unfit, global_best, avg_unfitness,
               (unsigned long long) avg_vars,
-              (unsigned long long) avg_clauses,
+              (unsigned long long) avg_irredundant,
               (unsigned long long) avg_binary, sat, unsat, unknown, pool_size,
               min_elapsed, avg_elapsed, max_elapsed, gen_end - gen_start,
               improved, skipped, aborted);

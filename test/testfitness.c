@@ -3,6 +3,7 @@
 
 #include "test.h"
 
+#include <inttypes.h>
 #include <math.h>
 
 static void test_remaining_clause_score_with_invalid_lit (void) {
@@ -53,6 +54,15 @@ static void test_remaining_unfitness_formula (void) {
   kissat_add (solver, 3);
   kissat_add (solver, 4);
   kissat_add (solver, 0);
+  // Duplicate one binary and one irredundant 3+ clause to ensure unfitness
+  // uses deduplicated clause counts.
+  kissat_add (solver, -2);
+  kissat_add (solver, 1);
+  kissat_add (solver, 0);
+  kissat_add (solver, 3);
+  kissat_add (solver, 2);
+  kissat_add (solver, 1);
+  kissat_add (solver, 0);
   // Add a 3-literal redundant clause and ensure it does not affect the
   // irredundant-clause component used in unfitness.
   const int redundant_clause[3] = {1, 2, 4};
@@ -61,7 +71,25 @@ static void test_remaining_unfitness_formula (void) {
   if (imported != 1)
     FATAL ("expected redundant shared clause to be imported, got %d", imported);
 
-  const double expected = 4.0 + 4.0 / sqrt (1.0 + 1.0);
+  const uint64_t dedup_binary =
+      kissat_get_solver_deduplicated_binary_clauses (solver);
+  if (dedup_binary != 1)
+    FATAL ("expected 1 deduplicated binary clause, got %" PRIu64,
+           dedup_binary);
+
+  const uint64_t dedup_irredundant =
+      kissat_get_solver_deduplicated_irredundant_clauses (solver);
+  if (dedup_irredundant != 4)
+    FATAL ("expected 4 deduplicated irredundant clauses, got %" PRIu64,
+           dedup_irredundant);
+
+  // Unfitness = nRemVars + sum_i log2(1 - 2^(-clauseSize[i])) over all
+  // non-empty clauses in the current formula (including duplicates and
+  // imported redundant clauses in this fixture).
+  const double l2 = log2 (1.0 - exp2 (-2.0));
+  const double l3 = log2 (1.0 - exp2 (-3.0));
+  const double l4 = log2 (1.0 - exp2 (-4.0));
+  const double expected = 4.0 + 2.0 * l2 + 5.0 * l3 + l4;
   const double got = kissat_get_remaining_unfitness (solver);
   if (fabs (got - expected) > 1e-9)
     FATAL ("expected unfitness %.17g, got %.17g", expected, got);
