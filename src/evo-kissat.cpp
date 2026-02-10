@@ -295,7 +295,7 @@ static void print_usage (const char *name) {
   printf ("  -s                         print complete statistics\n");
   printf ("  -v                         increase verbosity\n");
   printf ("  --partial                  print partial witness\n");
-  printf ("  --conflicts=<limit>        per-evaluation conflict limit\n");
+  printf ("  --conflicts=<limit>        per-evaluation conflict limit (default: remaining unknown vars)\n");
   printf ("  --decisions=<limit>        per-evaluation decision limit\n");
   printf ("  --time=<seconds>           global time limit\n");
   printf ("  --<option>=<value>         set Kissat option\n");
@@ -810,7 +810,8 @@ static Result evaluate_genome (const Genome &g, const Formula &formula,
                                const SharedPool &import_pool,
                                SharedPool *export_pool, ActiveSolvers &active,
                                std::atomic<bool> &stop, double deadline,
-                               int conflicts_limit, int decisions_limit,
+                               int conflicts_limit, bool conflicts_from_active,
+                               unsigned conflicts_divisor, int decisions_limit,
                                int eval_time_limit, unsigned eval_seed,
                                std::mutex &solution_mutex,
                                kissat *&solution_solver,
@@ -839,8 +840,20 @@ static Result evaluate_genome (const Genome &g, const Formula &formula,
   std::mt19937 import_rng (eval_seed ^ 0x9e3779b9U);
   import_shared (solver, formula, import_pool, opts.share_in, import_rng);
 
-  if (conflicts_limit >= 0)
-    kissat_set_conflict_limit (solver, (unsigned) conflicts_limit);
+  const unsigned divisor = conflicts_divisor ? conflicts_divisor : 1;
+  if (conflicts_from_active) {
+    const unsigned active_limit = kissat_get_solver_active_variables (solver);
+    unsigned scaled_limit = active_limit / divisor;
+    if (active_limit && !scaled_limit)
+      scaled_limit = 1;
+    kissat_set_conflict_limit (solver, scaled_limit);
+  } else if (conflicts_limit >= 0) {
+    const unsigned base_limit = (unsigned) conflicts_limit;
+    unsigned scaled_limit = base_limit / divisor;
+    if (base_limit && !scaled_limit)
+      scaled_limit = 1;
+    kissat_set_conflict_limit (solver, scaled_limit);
+  }
   if (decisions_limit >= 0)
     kissat_set_decision_limit (solver, (unsigned) decisions_limit);
 
@@ -938,7 +951,8 @@ static size_t run_evaluation_stage (
     const Formula &formula, const EvoOptions &opts,
     const std::vector<GeneSpec> &specs, const SharedPool &import_pool,
     SharedPool *export_pool, ActiveSolvers &active, std::atomic<bool> &stop,
-    double deadline, int conflicts_limit, int decisions_limit,
+    double deadline, int conflicts_limit, bool conflicts_from_active,
+    unsigned conflicts_divisor, int decisions_limit,
     int eval_time_limit, unsigned eval_seed,
     std::atomic<double> &global_best_hint, std::mutex &solution_mutex,
     kissat *&solution_solver, int &solution_status) {
@@ -1000,9 +1014,11 @@ static size_t run_evaluation_stage (
         const size_t idx = indices[pos];
         Result r = evaluate_genome (population[idx], formula, opts, specs,
                                     import_pool, export_pool, active, stop,
-                                    deadline, conflicts_limit, decisions_limit,
-                                    eval_time_limit, eval_seed, solution_mutex,
-                                    solution_solver, solution_status);
+                                    deadline, conflicts_limit,
+                                    conflicts_from_active, conflicts_divisor,
+                                    decisions_limit, eval_time_limit, eval_seed,
+                                    solution_mutex, solution_solver,
+                                    solution_status);
         results[idx] = std::move (r);
         if (results[idx].evaluated)
           atomic_min_relaxed (stage_best, results[idx].unfitness);
@@ -1053,12 +1069,6 @@ int main (int argc, char **argv) {
     fprintf (stderr, "could not parse input\n");
     return 1;
   }
-  if (!opts.conflicts_limit_set) {
-    const uint64_t max_int = (uint64_t) std::numeric_limits<int>::max ();
-    opts.conflicts_limit =
-        (int) (formula.clauses < max_int ? formula.clauses : max_int);
-  }
-
   if (!opts.quiet) {
     fprintf (stdout,
              "c evo-kissat: clauses %" PRIu64 ", vars %d, "
@@ -1114,12 +1124,7 @@ int main (int argc, char **argv) {
     for (size_t i = 0; i < population.size (); i++)
       all_indices.push_back (i);
 
-    int screen_conflicts = opts.conflicts_limit;
-    if (screen_conflicts >= 0) {
-      screen_conflicts /= 4;
-      if (screen_conflicts < 1)
-        screen_conflicts = 1;
-    }
+    const bool default_conflicts = !opts.conflicts_limit_set;
     int screen_eval_time = opts.eval_time_limit;
     if (screen_eval_time <= 0)
       screen_eval_time = 2;
@@ -1133,9 +1138,10 @@ int main (int argc, char **argv) {
     const unsigned screen_seed = rng ();
     evaluations += run_evaluation_stage (
         generation, "screen", all_indices, population, results, formula, opts,
-        specs, pool, nullptr, active, stop, deadline, screen_conflicts,
-        opts.decisions_limit, screen_eval_time, screen_seed, best_so_far,
-        solution_mutex, solution_solver, solution_status);
+        specs, pool, nullptr, active, stop, deadline, opts.conflicts_limit,
+        default_conflicts, 4, opts.decisions_limit, screen_eval_time,
+        screen_seed, best_so_far, solution_mutex, solution_solver,
+        solution_status);
 
     std::vector<size_t> ranked_stage1;
     ranked_stage1.reserve (results.size ());
@@ -1173,9 +1179,9 @@ int main (int argc, char **argv) {
       evaluations += run_evaluation_stage (
           generation, "full", full_indices, population, results, formula, opts,
           specs, pool, &generation_exports, active, stop, deadline,
-          opts.conflicts_limit, opts.decisions_limit, opts.eval_time_limit,
-          full_seed, best_so_far, solution_mutex, solution_solver,
-          solution_status);
+          opts.conflicts_limit, default_conflicts, 1, opts.decisions_limit,
+          opts.eval_time_limit, full_seed, best_so_far, solution_mutex,
+          solution_solver, solution_status);
     }
 
     std::vector<size_t> reeval_indices = full_indices;
@@ -1193,12 +1199,6 @@ int main (int argc, char **argv) {
     if (!stop.load () && reeval_indices.size () > 1) {
       // Re-evaluate the top subset on extra shared seeds and average
       // unfitness to reduce lucky-seed selection.
-      int reeval_conflicts = opts.conflicts_limit;
-      if (reeval_conflicts >= 0) {
-        reeval_conflicts /= 2;
-        if (reeval_conflicts < 1)
-          reeval_conflicts = 1;
-      }
       int reeval_eval_time = opts.eval_time_limit;
       if (reeval_eval_time <= 0)
         reeval_eval_time = 2;
@@ -1227,9 +1227,9 @@ int main (int argc, char **argv) {
         evaluations += run_evaluation_stage (
             generation, "reeval", reeval_indices, population, pass_results,
             formula, opts, specs, pool, nullptr, active, stop, deadline,
-            reeval_conflicts, opts.decisions_limit, reeval_eval_time,
-            pass_seed, best_so_far, solution_mutex, solution_solver,
-            solution_status);
+            opts.conflicts_limit, default_conflicts, 2, opts.decisions_limit,
+            reeval_eval_time, pass_seed, best_so_far, solution_mutex,
+            solution_solver, solution_status);
         for (size_t i = 0; i < reeval_indices.size (); i++) {
           const size_t idx = reeval_indices[i];
           const Result &rr = pass_results[idx];
