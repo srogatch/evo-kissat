@@ -387,18 +387,15 @@ double kissat_get_remaining_clause_score (kissat *solver) {
 double kissat_get_remaining_unfitness (kissat *solver) {
   kissat_require_initialized (solver);
   const double n_rem_vars = (double) solver->active;
-  const double n_binary_clauses = (double) solver->statistics.clauses_binary;
-  const double n_irredundant_clauses =
-      (double) solver->statistics.clauses_irredundant;
-  const double irredundant_minus_binary =
-      n_irredundant_clauses - n_binary_clauses;
-  const double log_term = log2 (irredundant_minus_binary > 1.0
-                                    ? irredundant_minus_binary
-                                    : 1.0);
+  const double n_binary_clauses_plus_one =
+      (double) solver->statistics.clauses_binary + 1.0;
+  const double n_irredundant_clauses_plus_one =
+      (double) solver->statistics.clauses_irredundant + 1.0;
 
   // Unfitness formula:
-  // nRemVars + log2(max(1.0, nIrredundant - nBinary)) - sqrt(nBinary)
-  return n_rem_vars + log_term - sqrt (n_binary_clauses);
+  // nRemVars - log2(nBinary + 1) + log2(nIrredundant + 1)
+  return n_rem_vars - log2 (n_binary_clauses_plus_one) +
+         log2 (n_irredundant_clauses_plus_one);
 }
 
 static bool shareable_external_literal (kissat *solver, int elit) {
@@ -734,24 +731,50 @@ int kissat_import_shared_clause (kissat *solver, unsigned size,
                   "incomplete clause (terminating zero not added)");
   kissat_require (lits || !size, "literal array zero pointer");
 
+  int res = 0;
+#if !defined(NDEBUG) && !defined(NOPTIONS)
+  int restore_check = -1;
+  if (GET_OPTION (check) > 1) {
+    // Shared clauses from another solver are not guaranteed to be RUP in this
+    // solver's current checker state. Disable strict checker insertion while
+    // importing and register imported clauses explicitly as unchecked.
+    restore_check = GET_OPTION (check);
+    (void) kissat_set_option (solver, "check", 1);
+  }
+#else
+  const int restore_check = -1;
+#endif
+
   if (!size) {
+#ifndef NDEBUG
+    if (restore_check > 1)
+      kissat_add_unchecked_external (solver, 0, 0);
+#endif
     if (!solver->inconsistent) {
       solver->inconsistent = true;
       CHECK_AND_ADD_EMPTY ();
       ADD_EMPTY_TO_PROOF ();
     }
-    return 2;
+    res = 2;
+    goto DONE;
   }
 
   solver->clause_satisfied = false;
   solver->clause_trivial = false;
   solver->clause_shrink = false;
+  bool unmappable = false;
 
   for (unsigned i = 0; i < size; i++) {
     const int elit = lits[i];
     kissat_require (elit, "zero literal in shared clause");
     kissat_require_valid_external_internal (elit);
     unsigned ilit = kissat_import_literal (solver, elit);
+    if (ilit == INVALID_LIT) {
+      // Clause contains a variable eliminated in this solver instance.
+      // Skip importing it into this instance.
+      unmappable = true;
+      break;
+    }
 
     const mark mark = MARK (ilit);
     if (!mark) {
@@ -775,15 +798,20 @@ int kissat_import_shared_clause (kissat *solver, unsigned size,
 
   const size_t isize = SIZE_STACK (solver->clause);
   unsigned *ilits = BEGIN_STACK (solver->clause);
-  int res = 0;
 
   if (solver->inconsistent) {
     res = 2;
+  } else if (unmappable) {
+    res = 0;
   } else if (solver->clause_satisfied || solver->clause_trivial) {
     res = 0;
   } else {
     kissat_activate_literals (solver, isize, ilits);
     if (!isize) {
+#ifndef NDEBUG
+      if (restore_check > 1)
+        kissat_add_unchecked_external (solver, 0, 0);
+#endif
       if (!solver->inconsistent) {
         solver->inconsistent = true;
         CHECK_AND_ADD_EMPTY ();
@@ -792,16 +820,42 @@ int kissat_import_shared_clause (kissat *solver, unsigned size,
       res = 2;
     } else if (isize == 1) {
       const unsigned unit = TOP_STACK (solver->clause);
+#ifndef NDEBUG
+      if (restore_check > 1) {
+        const int elit = kissat_export_literal (solver, unit);
+        if (elit)
+          kissat_add_unchecked_external (solver, 1, &elit);
+      }
+#endif
       kissat_learned_unit (solver, unit);
       if (!solver->level)
         (void) kissat_search_propagate (solver);
       res = 1;
     } else {
+#ifndef NDEBUG
+      if (restore_check > 1) {
+        bool valid = true;
+        int *elits =
+            kissat_malloc (solver, isize * sizeof *elits);
+        for (size_t i = 0; i < isize; i++) {
+          const int elit = kissat_export_literal (solver, ilits[i]);
+          if (!elit) {
+            valid = false;
+            break;
+          }
+          elits[i] = elit;
+        }
+        if (valid)
+          kissat_add_unchecked_external (solver, isize, elits);
+        kissat_free (solver, elits, isize * sizeof *elits);
+      }
+#endif
       (void) kissat_new_redundant_clause (solver, glue);
       res = 1;
     }
   }
 
+DONE:
   for (all_stack (unsigned, lit, solver->clause))
     MARK (lit) = MARK (NOT (lit)) = 0;
 
@@ -810,6 +864,11 @@ int kissat_import_shared_clause (kissat *solver, unsigned size,
   solver->clause_satisfied = false;
   solver->clause_trivial = false;
   solver->clause_shrink = false;
+
+#if !defined(NDEBUG) && !defined(NOPTIONS)
+  if (restore_check > 1)
+    (void) kissat_set_option (solver, "check", restore_check);
+#endif
 
   return res;
 }

@@ -73,7 +73,7 @@ struct SharedPool {
   std::unordered_set<uint64_t> binaries;
   std::vector<SharedClause> clauses;
   std::vector<uint64_t> clause_hashes;
-  std::unordered_map<uint64_t, size_t> clause_positions;
+  std::unordered_map<uint64_t, std::vector<size_t>> clause_buckets;
   size_t max_clauses = 0;
 };
 
@@ -98,6 +98,23 @@ static uint64_t hash_large_clause_lits (const std::vector<int> &lits) {
     hash ^= x + 0x9e3779b97f4a7c15ULL + (hash << 6) + (hash >> 2);
   }
   return hash;
+}
+
+static void remove_bucket_index (std::unordered_map<uint64_t, std::vector<size_t>> &buckets,
+                                 uint64_t hash, size_t idx) {
+  auto it = buckets.find (hash);
+  if (it == buckets.end ())
+    return;
+  std::vector<size_t> &bucket = it->second;
+  for (size_t i = 0; i < bucket.size (); i++) {
+    if (bucket[i] == idx) {
+      bucket[i] = bucket.back ();
+      bucket.pop_back ();
+      break;
+    }
+  }
+  if (bucket.empty ())
+    buckets.erase (it);
 }
 
 struct ActiveSolvers {
@@ -132,8 +149,9 @@ struct EvoOptions {
   bool witness = true;
   bool statistics = false;
   bool partial = false;
+  bool conflicts_limit_set = false;
   int verbose = 0;
-  int conflicts_limit = 10000;
+  int conflicts_limit = 100000;
   int decisions_limit = -1;
   int time_limit = 0;
   int eval_time_limit = 10;
@@ -277,15 +295,17 @@ static bool parse_args (int argc, char **argv, EvoOptions &opts) {
     else if (!strcmp (arg, "--partial"))
       opts.partial = true;
     else if (parse_int_option (arg, "conflicts", opts.conflicts_limit))
-      ;
+      opts.conflicts_limit_set = true;
     else if (parse_int_option (arg, "decisions", opts.decisions_limit))
       ;
     else if (parse_int_option (arg, "time", opts.time_limit))
       ;
     else {
       unsigned tmp = 0;
-      if (parse_uint_option (arg, "evo-conflicts", tmp))
+      if (parse_uint_option (arg, "evo-conflicts", tmp)) {
         opts.conflicts_limit = (int) tmp;
+        opts.conflicts_limit_set = true;
+      }
       else if (parse_uint_option (arg, "evo-pop", opts.population))
         ;
       else if (parse_uint_option (arg, "evo-evals", opts.max_evals))
@@ -675,10 +695,22 @@ static void import_shared (kissat *solver, const Formula &formula,
     if (kissat_import_shared_clause (solver, 2, pair, 1) == 2)
       return;
   }
-  for (const auto &cl : subset)
+  for (const auto &cl : subset) {
+    if (cl.lits.size () < 3)
+      continue;
+    bool valid = true;
+    for (int lit : cl.lits) {
+      if (!lit || std::abs (lit) > formula.max_var) {
+        valid = false;
+        break;
+      }
+    }
+    if (!valid)
+      continue;
     if (kissat_import_shared_clause (solver, (unsigned) cl.lits.size (),
                                      cl.lits.data (), cl.glue) == 2)
       return;
+  }
 }
 
 struct ExportContext {
@@ -706,26 +738,30 @@ static int export_shared_clause (void *state, unsigned size, unsigned glue,
   std::sort (cl.lits.begin (), cl.lits.end ());
   const uint64_t hash = hash_large_clause_lits (cl.lits);
   std::lock_guard<std::mutex> lock (ctx->pool->mutex);
-  auto found = ctx->pool->clause_positions.find (hash);
-  if (found != ctx->pool->clause_positions.end ()) {
-    SharedClause &existing = ctx->pool->clauses[found->second];
-    if (cl.glue < existing.glue)
-      existing = std::move (cl);
-    return 0;
+  auto found_bucket = ctx->pool->clause_buckets.find (hash);
+  if (found_bucket != ctx->pool->clause_buckets.end ()) {
+    for (size_t idx : found_bucket->second) {
+      SharedClause &existing = ctx->pool->clauses[idx];
+      if (existing.lits != cl.lits)
+        continue;
+      if (cl.glue < existing.glue)
+        existing = std::move (cl);
+      return 0;
+    }
   }
   if (ctx->pool->clauses.size () < ctx->max_pool) {
     ctx->pool->clauses.push_back (std::move (cl));
     ctx->pool->clause_hashes.push_back (hash);
-    ctx->pool->clause_positions[hash] = ctx->pool->clauses.size () - 1;
+    ctx->pool->clause_buckets[hash].push_back (ctx->pool->clauses.size () - 1);
   } else if (!ctx->pool->clauses.empty ()) {
     std::uniform_int_distribution<size_t> dist (
         0, ctx->pool->clauses.size () - 1);
     const size_t idx = dist (*ctx->rng);
     const uint64_t old_hash = ctx->pool->clause_hashes[idx];
-    ctx->pool->clause_positions.erase (old_hash);
+    remove_bucket_index (ctx->pool->clause_buckets, old_hash, idx);
     ctx->pool->clauses[idx] = std::move (cl);
     ctx->pool->clause_hashes[idx] = hash;
-    ctx->pool->clause_positions[hash] = idx;
+    ctx->pool->clause_buckets[hash].push_back (idx);
   }
   return 0;
 }
@@ -909,6 +945,11 @@ int main (int argc, char **argv) {
                      formula)) {
     fprintf (stderr, "could not parse input\n");
     return 1;
+  }
+  if (!opts.conflicts_limit_set) {
+    const uint64_t max_int = (uint64_t) std::numeric_limits<int>::max ();
+    opts.conflicts_limit =
+        (int) (formula.clauses < max_int ? formula.clauses : max_int);
   }
 
   if (!opts.quiet) {
