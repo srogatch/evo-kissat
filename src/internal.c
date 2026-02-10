@@ -885,8 +885,8 @@ double kissat_get_remaining_unfitness (kissat *solver) {
   assert (unique > 0);
 
   // To reduce rounding noise, compute each log term once per size bucket,
-  // sum buckets in ascending size order (more negative first), and only then
-  // add nRemVars.
+  // sum buckets in ascending size order (more negative first), scale by 0.5,
+  // and only then add nRemVars.
   long double grouped_sum = 0.0L;
   for (unsigned k = 1; k <= max_remaining; k++) {
     const uint64_t count = histogram[k];
@@ -900,7 +900,7 @@ double kissat_get_remaining_unfitness (kissat *solver) {
                   sizeof *histogram);
   kissat_dealloc (solver, literal_pool, total_literals, sizeof *literal_pool);
   kissat_dealloc (solver, signatures, clauses, sizeof *signatures);
-  return (double) (grouped_sum + (long double) n_rem_vars);
+  return (double) (0.5L * grouped_sum + (long double) n_rem_vars);
 }
 
 static bool shareable_external_literal (kissat *solver, int elit) {
