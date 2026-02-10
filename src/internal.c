@@ -390,6 +390,12 @@ typedef struct deduplicated_clause_signature {
   unsigned *lits;
 } deduplicated_clause_signature;
 
+typedef struct unfitness_clause_signature {
+  unsigned size;
+  unsigned *lits;
+  unsigned remaining;
+} unfitness_clause_signature;
+
 static int compare_uint64_values (const void *a, const void *b) {
   const uint64_t x = *(const uint64_t *) a;
   const uint64_t y = *(const uint64_t *) b;
@@ -423,6 +429,23 @@ static int compare_clause_signatures (const void *a, const void *b) {
     return 0;
   const int cmp =
       memcmp (x->lits, y->lits, x->size * sizeof *x->lits);
+  if (cmp < 0)
+    return -1;
+  if (cmp > 0)
+    return 1;
+  return 0;
+}
+
+static int compare_unfitness_clause_signatures (const void *a, const void *b) {
+  const unfitness_clause_signature *x = (const unfitness_clause_signature *) a;
+  const unfitness_clause_signature *y = (const unfitness_clause_signature *) b;
+  if (x->size < y->size)
+    return -1;
+  if (x->size > y->size)
+    return 1;
+  if (!x->size)
+    return 0;
+  const int cmp = memcmp (x->lits, y->lits, x->size * sizeof *x->lits);
   if (cmp < 0)
     return -1;
   if (cmp > 0)
@@ -581,25 +604,22 @@ uint64_t kissat_get_solver_deduplicated_active_clauses (kissat *solver) {
 double kissat_get_remaining_unfitness (kissat *solver) {
   kissat_require_initialized (solver);
   const value *const values = solver->values;
-  double sum = (double) solver->active;
+  const double n_rem_vars = (double) solver->active;
+  size_t clauses = 0;
+  size_t total_literals = 0;
 
-  // For a clause with 'k' unknown literals, add log2(1 - 2^-k).
-  // Empty clauses (k = 0) are ignored by request.
-#define ADD_CLAUSE_TERM(REMAINING) \
-  do { \
-    const unsigned k = (REMAINING); \
-    if (k) \
-      sum += log2 (1.0 - exp2 (-(double) k)); \
-  } while (0)
-
+  // First pass: count potentially contributing clauses and total literal
+  // storage for canonical signatures.
   for (all_clauses (c)) {
     if (c->garbage)
       continue;
     bool satisfied = false;
+    unsigned valid = 0;
     unsigned remaining = 0;
     for (all_literals_in_clause (lit, c)) {
       if (lit == INVALID_LIT || lit >= LITS)
         continue;
+      valid++;
       const value v = values[lit];
       if (v > 0) {
         satisfied = true;
@@ -608,8 +628,12 @@ double kissat_get_remaining_unfitness (kissat *solver) {
       if (!v)
         remaining++;
     }
-    if (!satisfied)
-      ADD_CLAUSE_TERM (remaining);
+    if (satisfied || !valid || !remaining)
+      continue;
+    clauses++;
+    if (SIZE_MAX - total_literals < valid)
+      return n_rem_vars;
+    total_literals += valid;
   }
 
   if (solver->watching) {
@@ -621,7 +645,6 @@ double kissat_get_remaining_unfitness (kissat *solver) {
         const unsigned other = watch.binary.lit;
         if (other == INVALID_LIT || other >= LITS)
           continue;
-        // Count each binary clause once (not once per watch direction).
         if (lit > other)
           continue;
         const value v1 = values[lit];
@@ -629,7 +652,12 @@ double kissat_get_remaining_unfitness (kissat *solver) {
         if (v1 > 0 || v2 > 0)
           continue;
         const unsigned remaining = (!v1) + (!v2);
-        ADD_CLAUSE_TERM (remaining);
+        if (!remaining)
+          continue;
+        clauses++;
+        if (SIZE_MAX - total_literals < 2)
+          return n_rem_vars;
+        total_literals += 2;
       }
     }
   } else {
@@ -641,7 +669,6 @@ double kissat_get_remaining_unfitness (kissat *solver) {
         const unsigned other = watch.binary.lit;
         if (other == INVALID_LIT || other >= LITS)
           continue;
-        // Count each binary clause once (not once per watch direction).
         if (lit > other)
           continue;
         const value v1 = values[lit];
@@ -649,7 +676,12 @@ double kissat_get_remaining_unfitness (kissat *solver) {
         if (v1 > 0 || v2 > 0)
           continue;
         const unsigned remaining = (!v1) + (!v2);
-        ADD_CLAUSE_TERM (remaining);
+        if (!remaining)
+          continue;
+        clauses++;
+        if (SIZE_MAX - total_literals < 2)
+          return n_rem_vars;
+        total_literals += 2;
       }
     }
   }
@@ -669,12 +701,206 @@ double kissat_get_remaining_unfitness (kissat *solver) {
     const value v = values[ilit];
     if (v > 0)
       continue;
-    const unsigned remaining = !v;
-    ADD_CLAUSE_TERM (remaining);
+    if (!v) {
+      clauses++;
+      if (SIZE_MAX - total_literals < 1)
+        return n_rem_vars;
+      total_literals++;
+    }
   }
 
-#undef ADD_CLAUSE_TERM
-  return sum;
+  if (!clauses)
+    return n_rem_vars;
+
+  unfitness_clause_signature *signatures =
+      kissat_nalloc (solver, clauses, sizeof *signatures);
+  unsigned *literal_pool =
+      kissat_nalloc (solver, total_literals, sizeof *literal_pool);
+
+  size_t idx = 0;
+  unsigned *next = literal_pool;
+
+  // Second pass: materialize canonical signatures and associated remaining
+  // unknown literal counts.
+  for (all_clauses (c)) {
+    if (c->garbage)
+      continue;
+    bool satisfied = false;
+    unsigned valid = 0;
+    unsigned remaining = 0;
+    for (all_literals_in_clause (lit, c)) {
+      if (lit == INVALID_LIT || lit >= LITS)
+        continue;
+      valid++;
+      const value v = values[lit];
+      if (v > 0) {
+        satisfied = true;
+        break;
+      }
+      if (!v)
+        remaining++;
+    }
+    if (satisfied || !valid || !remaining)
+      continue;
+
+    signatures[idx].size = valid;
+    signatures[idx].lits = next;
+    signatures[idx].remaining = remaining;
+    unsigned j = 0;
+    for (all_literals_in_clause (lit, c)) {
+      if (lit == INVALID_LIT || lit >= LITS)
+        continue;
+      next[j++] = lit;
+    }
+    assert (j == valid);
+    qsort (next, valid, sizeof *next, compare_unsigned_values);
+    next += valid;
+    idx++;
+  }
+
+  if (solver->watching) {
+    for (all_literals (lit)) {
+      watches *watches = &WATCHES (lit);
+      for (all_binary_blocking_watches (watch, *watches)) {
+        if (!watch.type.binary)
+          continue;
+        const unsigned other = watch.binary.lit;
+        if (other == INVALID_LIT || other >= LITS)
+          continue;
+        if (lit > other)
+          continue;
+        const value v1 = values[lit];
+        const value v2 = values[other];
+        if (v1 > 0 || v2 > 0)
+          continue;
+        const unsigned remaining = (!v1) + (!v2);
+        if (!remaining)
+          continue;
+
+        signatures[idx].size = 2;
+        signatures[idx].lits = next;
+        signatures[idx].remaining = remaining;
+        next[0] = lit;
+        next[1] = other;
+        if (next[0] > next[1]) {
+          const unsigned tmp = next[0];
+          next[0] = next[1];
+          next[1] = tmp;
+        }
+        next += 2;
+        idx++;
+      }
+    }
+  } else {
+    for (all_literals (lit)) {
+      watches *watches = &WATCHES (lit);
+      for (all_binary_large_watches (watch, *watches)) {
+        if (!watch.type.binary)
+          continue;
+        const unsigned other = watch.binary.lit;
+        if (other == INVALID_LIT || other >= LITS)
+          continue;
+        if (lit > other)
+          continue;
+        const value v1 = values[lit];
+        const value v2 = values[other];
+        if (v1 > 0 || v2 > 0)
+          continue;
+        const unsigned remaining = (!v1) + (!v2);
+        if (!remaining)
+          continue;
+
+        signatures[idx].size = 2;
+        signatures[idx].lits = next;
+        signatures[idx].remaining = remaining;
+        next[0] = lit;
+        next[1] = other;
+        if (next[0] > next[1]) {
+          const unsigned tmp = next[0];
+          next[0] = next[1];
+          next[1] = tmp;
+        }
+        next += 2;
+        idx++;
+      }
+    }
+  }
+
+  for (all_stack (int, elit, solver->units)) {
+    const unsigned eidx = ABS (elit);
+    if (eidx >= SIZE_STACK (solver->import))
+      continue;
+    const import *const imported = &PEEK_STACK (solver->import, eidx);
+    if (!imported->imported || imported->eliminated)
+      continue;
+    unsigned ilit = imported->lit;
+    if (elit < 0)
+      ilit = NOT (ilit);
+    if (ilit >= LITS)
+      continue;
+    const value v = values[ilit];
+    if (v > 0 || v < 0)
+      continue;
+
+    signatures[idx].size = 1;
+    signatures[idx].lits = next;
+    signatures[idx].remaining = 1;
+    next[0] = ilit;
+    next++;
+    idx++;
+  }
+
+  assert (idx == clauses);
+
+  // Deduplicate clauses by canonical literal signature.
+  qsort (signatures, clauses, sizeof *signatures,
+         compare_unfitness_clause_signatures);
+  size_t unique = 0;
+  unsigned max_remaining = 0;
+  for (size_t i = 0; i < clauses; i++) {
+    if (i &&
+        !compare_unfitness_clause_signatures (&signatures[i - 1],
+                                              &signatures[i])) {
+      assert (signatures[i - 1].remaining == signatures[i].remaining);
+      continue;
+    }
+    const unsigned remaining = signatures[i].remaining;
+    assert (remaining > 0);
+    unique++;
+    if (max_remaining < remaining)
+      max_remaining = remaining;
+  }
+
+  uint64_t *histogram =
+      kissat_calloc (solver, (size_t) max_remaining + 1, sizeof *histogram);
+  for (size_t i = 0; i < clauses; i++) {
+    if (i &&
+        !compare_unfitness_clause_signatures (&signatures[i - 1],
+                                              &signatures[i]))
+      continue;
+    const unsigned remaining = signatures[i].remaining;
+    assert (remaining > 0 && remaining <= max_remaining);
+    histogram[remaining]++;
+  }
+  assert (unique > 0);
+
+  // To reduce rounding noise, compute each log term once per size bucket,
+  // sum buckets in ascending size order (more negative first), and only then
+  // add nRemVars.
+  long double grouped_sum = 0.0L;
+  for (unsigned k = 1; k <= max_remaining; k++) {
+    const uint64_t count = histogram[k];
+    if (!count)
+      continue;
+    const long double term = log2l (1.0L - exp2l (-(long double) k));
+    grouped_sum += (long double) count * term;
+  }
+
+  kissat_dealloc (solver, histogram, (size_t) max_remaining + 1,
+                  sizeof *histogram);
+  kissat_dealloc (solver, literal_pool, total_literals, sizeof *literal_pool);
+  kissat_dealloc (solver, signatures, clauses, sizeof *signatures);
+  return (double) (grouped_sum + (long double) n_rem_vars);
 }
 
 static bool shareable_external_literal (kissat *solver, int elit) {

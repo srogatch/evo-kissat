@@ -84,12 +84,12 @@ static void test_remaining_unfitness_formula (void) {
            dedup_irredundant);
 
   // Unfitness = nRemVars + sum_i log2(1 - 2^(-clauseSize[i])) over all
-  // non-empty clauses in the current formula (including duplicates and
-  // imported redundant clauses in this fixture).
+  // non-empty clauses in the current formula after deduplicating clauses by
+  // canonical literal signature.
   const double l2 = log2 (1.0 - exp2 (-2.0));
   const double l3 = log2 (1.0 - exp2 (-3.0));
   const double l4 = log2 (1.0 - exp2 (-4.0));
-  const double expected = 4.0 + 2.0 * l2 + 5.0 * l3 + l4;
+  const double expected = 4.0 + l2 + 4.0 * l3 + l4;
   const double got = kissat_get_remaining_unfitness (solver);
   if (fabs (got - expected) > 1e-9)
     FATAL ("expected unfitness %.17g, got %.17g", expected, got);
